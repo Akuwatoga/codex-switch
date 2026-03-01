@@ -3,18 +3,19 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Codex 账号管理器</title>
+    <title>Codex Switch</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
     <!-- 顶部工具栏 -->
     <div class="titlebar">
         <div class="titlebar-left">
-            <span class="app-title">Codex 账号管理器</span>
+            <span class="app-title">Codex Switch</span>
         </div>
         <div class="titlebar-right">
-            <button class="toolbar-btn" id="quick-save-btn" onclick="quickSave()" title="备份当前账号">备份</button>
+            <button class="toolbar-btn" id="quick-save-btn" onclick="quickSave()" title="导入当前账号">导入当前账号</button>
             <button class="toolbar-btn" onclick="refreshData()" title="刷新列表">刷新</button>
+            <button class="toolbar-btn" onclick="openSettingsModal()" title="查看设置和日志">设置</button>
         </div>
     </div>
 
@@ -29,8 +30,8 @@
                         <th>账号名称</th>
                         <th>邮箱</th>
                         <th>计划</th>
-                        <th>5小时用量</th>
-                        <th>周用量</th>
+                        <th>5小时剩余</th>
+                        <th>周剩余</th>
                         <th>保存时间</th>
                         <th width="180">操作</th>
                     </tr>
@@ -49,7 +50,7 @@
             <div id="empty-state" class="empty-state" style="display: none;">
                 <div class="empty-text">还没有保存的账号配置</div>
                 <button class="btn-primary" onclick="quickSave()">
-                    备份当前账号
+                    导入当前账号
                 </button>
             </div>
         </div>
@@ -57,7 +58,7 @@
         <!-- 底部状态栏 -->
         <div class="statusbar">
             <div class="statusbar-item">
-                <span id="status-text">刷新用量前请先用 Codex 发送消息</span>
+                <span id="status-text">刷新会直接读取官方用量接口</span>
             </div>
             <div class="statusbar-item">
                 <span id="account-count">共 0 个账号</span>
@@ -66,6 +67,57 @@
     </div>
 
     <div id="message-area"></div>
+
+    <div class="dialog-overlay" id="settings-overlay" style="display: none;" onclick="handleSettingsOverlayClick(event)">
+        <div class="dialog settings-dialog">
+            <div class="dialog-header">
+                <h3>设置</h3>
+                <button class="dialog-close" onclick="closeSettingsModal()" aria-label="关闭">×</button>
+            </div>
+            <div class="dialog-body settings-body">
+                <div class="form-group">
+                    <label for="max-log-entries">日志保留条数</label>
+                    <input id="max-log-entries" class="form-input" type="number" min="50" max="5000" step="50">
+                    <div class="form-hint">仅控制本应用保留的本地日志数量。最新错误会一直追加写入。</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="proxy-url">代理地址</label>
+                    <input id="proxy-url" class="form-input" type="text" placeholder="host:port">
+                    <div class="form-hint">只需填写一个代理地址。未填写协议时，应用会自动补全 `http://`。</div>
+                </div>
+
+                <div class="settings-meta">
+                    <div><strong>日志文件</strong></div>
+                    <div id="log-file-path" class="settings-path">-</div>
+                </div>
+
+                <div class="settings-meta">
+                    <div><strong>日志条数</strong></div>
+                    <div id="log-entry-count">0</div>
+                </div>
+
+                <div class="settings-meta">
+                    <div><strong>最近错误</strong></div>
+                    <div id="last-error-time">-</div>
+                </div>
+
+                <div class="settings-actions">
+                    <button class="btn-secondary" onclick="refreshSettingsLogs()">刷新日志</button>
+                    <button class="btn-danger" onclick="clearErrorLogs()">清空日志</button>
+                </div>
+
+                <div class="form-group">
+                    <label for="settings-log-content">错误日志</label>
+                    <pre id="settings-log-content" class="log-viewer">暂无日志</pre>
+                </div>
+            </div>
+            <div class="dialog-footer">
+                <button class="btn-secondary" onclick="closeSettingsModal()">关闭</button>
+                <button class="btn-primary" onclick="saveSettingsModal()">保存设置</button>
+            </div>
+        </div>
+    </div>
 
     <script type="module" src="/main.js"></script>
 </body>

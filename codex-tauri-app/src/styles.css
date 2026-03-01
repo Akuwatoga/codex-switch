@@ -324,6 +324,10 @@ body {
     flex-direction: column;
 }
 
+.settings-dialog {
+    max-width: 760px;
+}
+
 .dialog-header {
     padding: 20px 24px;
     border-bottom: 1px solid var(--border);
@@ -364,6 +368,56 @@ body {
     display: flex;
     gap: 10px;
     justify-content: flex-end;
+}
+
+.settings-body {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.settings-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    background: #f8fafc;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.settings-path {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    color: var(--text-light);
+    word-break: break-all;
+}
+
+.settings-actions {
+    display: flex;
+    gap: 10px;
+}
+
+.form-hint {
+    margin-top: 8px;
+    color: var(--text-light);
+    font-size: 12px;
+}
+
+.log-viewer {
+    min-height: 260px;
+    max-height: 360px;
+    overflow: auto;
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: #0f172a;
+    color: #e2e8f0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
 
 .form-group {

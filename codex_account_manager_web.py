@@ -6,13 +6,18 @@ OpenAI Codex 账号配置管理器 - Web版本
 """
 
 import json
-import shutil
-import base64
 import webbrowser
 from datetime import datetime
-from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
+from codex_auth import (
+    build_account_record,
+    extract_email_from_auth,
+    extract_plan_from_auth,
+    extract_stored_auth,
+    same_account,
+    validate_auth_config,
+)
 from usage_checker import OpenAIUsageChecker
 from config_utils import generate_account_name, get_config_paths
 
@@ -32,56 +37,7 @@ class CodexAccountManagerWeb:
     
     def extract_email_from_token(self, config):
         """从token中提取邮箱地址"""
-        try:
-            if not config or not isinstance(config, dict):
-                return None
-                
-            # 首先尝试从id_token中提取
-            if 'tokens' in config and 'id_token' in config['tokens']:
-                id_token = config['tokens']['id_token']
-                if not id_token:
-                    return None
-                parts = id_token.split('.')
-                if len(parts) >= 2:
-                    payload = parts[1]
-                    padding = 4 - (len(payload) % 4)
-                    if padding != 4:
-                        payload += '=' * padding
-                    
-                    try:
-                        decoded = base64.b64decode(payload)
-                        token_data = json.loads(decoded.decode('utf-8'))
-                        if token_data and isinstance(token_data, dict) and 'email' in token_data:
-                            return token_data['email']
-                    except:
-                        pass
-            
-            # 备用方法：从access_token中提取
-            if 'tokens' in config and 'access_token' in config['tokens']:
-                access_token = config['tokens']['access_token']
-                if not access_token:
-                    return None
-                parts = access_token.split('.')
-                if len(parts) >= 2:
-                    payload = parts[1]
-                    padding = 4 - (len(payload) % 4)
-                    if padding != 4:
-                        payload += '=' * padding
-                    
-                    try:
-                        decoded = base64.b64decode(payload)
-                        token_data = json.loads(decoded.decode('utf-8'))
-                        if (token_data and isinstance(token_data, dict) and 
-                            'https://api.openai.com/profile' in token_data):
-                            profile = token_data['https://api.openai.com/profile']
-                            if profile and isinstance(profile, dict) and 'email' in profile:
-                                return profile['email']
-                    except:
-                        pass
-            
-            return None
-        except Exception:
-            return None
+        return extract_email_from_auth(config)
 
 
     def get_accounts_data(self):
@@ -90,12 +46,11 @@ class CodexAccountManagerWeb:
         account_files = list(self.accounts_dir.glob("*.json"))
         
         # 获取当前账号邮箱用于标记
-        current_email = None
+        current_config = None
         try:
             if self.system_auth_file.exists():
                 with open(self.system_auth_file, 'r', encoding='utf-8') as f:
                     current_config = json.load(f)
-                current_email = self.extract_email_from_token(current_config)
         except:
             pass
         
@@ -109,25 +64,10 @@ class CodexAccountManagerWeb:
                 saved_at = config.get('saved_at', '未知时间')
                 
                 # 检查是否是当前账号
-                is_current = email == current_email if current_email else False
+                is_current = same_account(current_config, config)
                 
                 # 获取账号状态
-                plan_type = "未知"
-                try:
-                    if 'tokens' in config and 'access_token' in config['tokens']:
-                        access_token = config['tokens']['access_token']
-                        parts = access_token.split('.')
-                        if len(parts) >= 2:
-                            payload = parts[1]
-                            padding = 4 - (len(payload) % 4)
-                            if padding != 4:
-                                payload += '=' * padding
-                            decoded = base64.b64decode(payload)
-                            token_data = json.loads(decoded.decode('utf-8'))
-                            auth_info = token_data.get('https://api.openai.com/auth', {})
-                            plan_type = auth_info.get('chatgpt_plan_type', '未知')
-                except:
-                    pass
+                plan_type = extract_plan_from_auth(config) or "未知"
                 
                 # 格式化时间
                 try:
@@ -162,13 +102,10 @@ class CodexAccountManagerWeb:
             email = self.extract_email_from_token(current_config)
             if email:
                 account_name = generate_account_name(email)
-                current_config['saved_at'] = datetime.now().isoformat()
-                current_config['account_name'] = account_name
-                current_config['email'] = email
-                
+                account_record = build_account_record(current_config, account_name, saved_at=datetime.now().isoformat())
                 account_file = self.accounts_dir / f"{account_name}.json"
                 with open(account_file, 'w', encoding='utf-8') as f:
-                    json.dump(current_config, f, indent=2, ensure_ascii=False)
+                    json.dump(account_record, f, indent=2, ensure_ascii=False)
                 
                 return {"success": f"成功保存账号: {account_name} ({email})"}
             else:
@@ -190,13 +127,13 @@ class CodexAccountManagerWeb:
             with open(account_file, 'r', encoding='utf-8') as f:
                 target_config = json.load(f)
             
-            # 移除管理字段，只保留原始配置
-            clean_config = {
-                "OPENAI_API_KEY": target_config.get("OPENAI_API_KEY"),
-                "tokens": target_config.get("tokens"),
-                "last_refresh": target_config.get("last_refresh")
-            }
+            clean_config = extract_stored_auth(target_config)
+            validate_auth_config(clean_config)
             
+            if self.system_auth_file.exists():
+                backup_file = self.system_auth_file.with_suffix('.json.backup')
+                shutil.copy2(self.system_auth_file, backup_file)
+
             # 直接写入系统 Codex 配置
             self.system_auth_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.system_auth_file, 'w', encoding='utf-8') as f:
@@ -223,12 +160,11 @@ class CodexAccountManagerWeb:
         """检查账号用量"""
         try:
             # 获取当前账号邮箱
-            current_email = None
+            current_config = None
             try:
                 if self.system_auth_file.exists():
                     with open(self.system_auth_file, 'r', encoding='utf-8') as f:
                         current_config = json.load(f)
-                    current_email = self.extract_email_from_token(current_config)
             except:
                 pass
             
@@ -245,13 +181,13 @@ class CodexAccountManagerWeb:
                 email = config.get('email') or self.extract_email_from_token(config)
                 
                 # 判断是否是当前账号
-                is_current_account = email == current_email if current_email and email else False
+                is_current_account = same_account(current_config, config)
             else:
                 # 检查当前账号
-                if not self.auth_file.exists():
+                if not self.system_auth_file.exists():
                     return {"error": "当前没有活跃的账号配置"}
                 
-                with open(self.auth_file, 'r', encoding='utf-8') as f:
+                with open(self.system_auth_file, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                 
                 # 提取邮箱
@@ -263,24 +199,31 @@ class CodexAccountManagerWeb:
             
             # 创建用量检查器
             checker = OpenAIUsageChecker()
-            
-            # 所有账号都只从缓存读取，不自动查询session
+
+            if is_current_account:
+                live_auth = current_config if current_config else config
+                summary = checker.get_usage_summary(email, auth_data=live_auth)
+                if summary.get("status") == "success":
+                    return {"success": True, "data": summary}
+
             cached_data = checker.load_usage_data(email)
             if cached_data:
                 summary = {
                     "email": email,
                     "check_time": cached_data.get("check_time", ""),
                     "status": f"success{'(当前账号缓存)' if is_current_account else '(缓存)'}",
+                    "plan_type": cached_data.get("plan_type"),
                     "usage_data": cached_data.get("token_usage", {}),
                     "rate_limits": cached_data.get("rate_limits", {}),
+                    "additional_rate_limits": cached_data.get("additional_rate_limits", []),
                     "errors": cached_data.get("errors", []),
                     "from_cache": True
                 }
             else:
                 if is_current_account:
-                    return {"error": "当前账号暂无用量数据，请先用 codex 发送消息后点击「刷新用量」按钮"}
+                    return {"error": "当前账号实时用量查询失败，且没有可用缓存"}
                 else:
-                    return {"error": f"账号 {email} 没有缓存数据，请先切换到该账号并在codex中发送一条消息后，点击「刷新用量」按钮"}
+                    return {"error": f"账号 {email} 没有缓存数据，请先切换到该账号后点击「刷新用量」按钮"}
             
             return {"success": True, "data": summary}
             
@@ -292,16 +235,10 @@ class CodexAccountManagerWeb:
         """添加配置文件"""
         try:
             config = json.loads(config_content)
-            email = self.extract_email_from_token(config)
-            
-            config['saved_at'] = datetime.now().isoformat()
-            config['account_name'] = account_name
-            if email:
-                config['email'] = email
-            
+            account_record = build_account_record(config, account_name, saved_at=datetime.now().isoformat())
             account_file = self.accounts_dir / f"{account_name}.json"
             with open(account_file, 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+                json.dump(account_record, f, indent=2, ensure_ascii=False)
             
             return {"success": f"成功保存账号配置: {account_name}"}
             
@@ -311,7 +248,7 @@ class CodexAccountManagerWeb:
             return {"error": f"保存失败: {e}"}
 
     def refresh_current_usage(self):
-        """手动刷新当前账号的用量（从session读取并更新缓存）"""
+        """手动刷新当前账号的用量（从官方接口读取并更新缓存）"""
         try:
             if not self.system_auth_file.exists():
                 return {"error": "未找到当前账号配置"}
@@ -324,22 +261,23 @@ class CodexAccountManagerWeb:
             if not email:
                 return {"error": "未能提取当前账号邮箱信息"}
             
-            # 从session读取最新用量数据
             from usage_checker import OpenAIUsageChecker
             checker = OpenAIUsageChecker()
-            summary = checker.get_usage_summary(email)
+            summary = checker.get_usage_summary(email, auth_data=current_config)
             
             if summary["status"] == "success":
                 # 保存到缓存
                 cache_data = {
                     "check_time": summary["check_time"],
                     "status": summary["status"],
+                    "plan_type": summary.get("plan_type"),
                     "token_usage": summary.get("token_usage", {}),
                     "rate_limits": summary.get("rate_limits", {}),
+                    "additional_rate_limits": summary.get("additional_rate_limits", []),
                     "errors": summary.get("errors", [])
                 }
                 checker.save_usage_data(email, cache_data)
-                return {"success": f"已刷新账号 {email} 的用量数据"}
+                return {"success": f"已刷新账号 {email} 的用量数据", "data": summary}
             else:
                 errors = summary.get("errors", [])
                 error_msg = errors[0] if errors else "未知错误"
@@ -424,7 +362,7 @@ class WebHandler(BaseHTTPRequestHandler):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Codex 账号管理器</title>
+    <title>Codex Switch</title>
     <style>
         * { 
             margin: 0; 
@@ -891,8 +829,8 @@ class WebHandler(BaseHTTPRequestHandler):
 </head>
 <body>
     <div class="header">
-        <h1>Codex 账号管理器</h1>
-        <p>智能管理与切换多个 OpenAI 账号配置</p>
+        <h1>Codex Switch</h1>
+        <p>智能管理与切换多个 Codex 账号配置</p>
     </div>
 
     <div class="container">
@@ -904,14 +842,14 @@ class WebHandler(BaseHTTPRequestHandler):
                 <div class="card-body">
                     <div class="toolbar">
                         <button class="btn btn-success" id="quick-save-btn" onclick="quickSave()">
-                            快速备份当前账号
+                            导入当前账号
                         </button>
                         <button class="btn btn-secondary" onclick="refreshData()">
                             刷新页面
                         </button>
                     </div>
                     <div class="alert" style="background: #f0f9ff; border-color: #0ea5e9; color: #0c4a6e; margin-bottom: 20px;">
-                        只能刷新当前账号的用量数据。刷新数据前请先用 codex 发送消息后点击「刷新用量」按钮。
+                        只能刷新当前账号的用量数据。点击「刷新用量」后会直接向官方接口拉取最新额度。
                     </div>
                     <div id="accounts-list" class="accounts-grid">
                         <div class="empty-state">
@@ -1172,7 +1110,7 @@ class WebHandler(BaseHTTPRequestHandler):
                     // 立即刷新界面显示新的当前账号
                     setTimeout(async () => {
                         await loadAccounts();
-                        showMessage(`已切换到账号 ${accountName}，请用 codex 发送消息后刷新用量`);
+                        showMessage(`已切换到账号 ${accountName}，现在可以直接刷新官方用量`);
                     }, 1000);
                 } else {
                     showMessage(result.error, 'error');
@@ -1210,6 +1148,88 @@ class WebHandler(BaseHTTPRequestHandler):
             }
         }
 
+        function getResetDate(limit) {
+            if (!limit) return null;
+            if (typeof limit.resets_at === 'number') {
+                return new Date(limit.resets_at * 1000);
+            }
+            if (typeof limit.resets_in_seconds === 'number') {
+                return new Date(Date.now() + limit.resets_in_seconds * 1000);
+            }
+            return null;
+        }
+
+        function getRemainingPercent(limit) {
+            const usedPercent = Number(limit?.used_percent);
+            if (!Number.isFinite(usedPercent)) return null;
+
+            const remainingPercent = 100 - usedPercent;
+            return Math.max(0, Math.min(100, Math.round(remainingPercent)));
+        }
+
+        function renderUsageSummary(accountName, summary) {
+            const usageElement = document.getElementById(`usage-${accountName}`);
+            if (!usageElement) return;
+
+            let usageText = '';
+            if (summary.status && summary.status.includes('success')) {
+                let primaryPercent = null;
+                let secondaryPercent = null;
+                let primaryResetInfo = '';
+                let secondaryResetInfo = '';
+                let cacheIcon = '';
+                
+                if (summary.from_cache) {
+                    cacheIcon = '<span style="color: var(--text-light);">[缓存]</span>';
+                }
+                
+                if (summary.rate_limits) {
+                    if (summary.rate_limits.primary) {
+                        primaryPercent = getRemainingPercent(summary.rate_limits.primary);
+                        const resetTime = getResetDate(summary.rate_limits.primary);
+                        if (resetTime) {
+                            primaryResetInfo = resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
+                        }
+                    }
+                    if (summary.rate_limits.secondary) {
+                        secondaryPercent = getRemainingPercent(summary.rate_limits.secondary);
+                        const resetTime = getResetDate(summary.rate_limits.secondary);
+                        if (resetTime) {
+                            secondaryResetInfo = `${resetTime.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})} ${resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`;
+                        }
+                    }
+                }
+                const percentValues = [primaryPercent, secondaryPercent].filter(v => Number.isFinite(v));
+                const minPercent = percentValues.length ? Math.min(...percentValues) : null;
+                const barWidth = minPercent ?? 0;
+                const barColor = minPercent === null
+                    ? 'var(--text-light)'
+                    : minPercent < 20
+                        ? 'var(--danger)'
+                        : minPercent < 40
+                            ? 'var(--warning)'
+                            : 'var(--success)';
+                usageText = `
+                    <div style="margin-top: 8px;">
+                        <div class="usage-bar">
+                            <div class="usage-fill" style="width: ${barWidth}%; background: ${barColor};"></div>
+                        </div>
+                        <div style="font-size: 14px; color: var(--text-light); display: flex; justify-content: space-between;">
+                            <span>5h剩余: ${primaryPercent === null ? '-' : `${primaryPercent}%`} ${primaryResetInfo ? `(${primaryResetInfo}重置)` : ''}</span>
+                            <span>${cacheIcon}</span>
+                        </div>
+                        <div style="font-size: 14px; color: var(--text-light);">
+                            周剩余: ${secondaryPercent === null ? '-' : `${secondaryPercent}%`} ${secondaryResetInfo ? `(${secondaryResetInfo}重置)` : ''}
+                        </div>
+                    </div>
+                `;
+            } else {
+                usageText = `<div style="color: var(--warning); font-size: 12px; margin-top: 8px;">[查询失败]</div>`;
+            }
+
+            usageElement.innerHTML = usageText;
+        }
+
         async function loadAccountUsage(accountName) {
             const usageElement = document.getElementById(`usage-${accountName}`);
             if (!usageElement) return;
@@ -1219,54 +1239,7 @@ class WebHandler(BaseHTTPRequestHandler):
                 const result = await response.json();
 
                 if (result.success) {
-                    const summary = result.data;
-                    
-                    let usageText = '';
-                    if (summary.status && summary.status.includes('success')) {
-                        let primaryPercent = 0;
-                        let secondaryPercent = 0;
-                        let primaryResetInfo = '';
-                        let secondaryResetInfo = '';
-                        let cacheIcon = '';
-                        
-                        if (summary.from_cache) {
-                            cacheIcon = '<span style="color: var(--text-light);">[缓存]</span>';
-                        }
-                        
-                        if (summary.rate_limits) {
-                            if (summary.rate_limits.primary) {
-                                primaryPercent = parseInt(summary.rate_limits.primary.used_percent) || 0;
-                                const resetSeconds = summary.rate_limits.primary.resets_in_seconds;
-                                const resetTime = new Date(Date.now() + resetSeconds * 1000);
-                                primaryResetInfo = resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-                            }
-                            if (summary.rate_limits.secondary) {
-                                secondaryPercent = parseInt(summary.rate_limits.secondary.used_percent) || 0;
-                                const resetSeconds = summary.rate_limits.secondary.resets_in_seconds;
-                                const resetTime = new Date(Date.now() + resetSeconds * 1000);
-                                secondaryResetInfo = `${resetTime.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})} ${resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`;
-                            }
-                        }
-                        const maxPercent = Math.max(primaryPercent, secondaryPercent);
-                        const barColor = maxPercent > 80 ? 'var(--danger)' : maxPercent > 60 ? 'var(--warning)' : 'var(--success)';
-                        usageText = `
-                            <div style="margin-top: 8px;">
-                                <div class="usage-bar">
-                                    <div class="usage-fill" style="width: ${maxPercent}%; background: ${barColor};"></div>
-                                </div>
-                                <div style="font-size: 14px; color: var(--text-light); display: flex; justify-content: space-between;">
-                                    <span>5h: ${primaryPercent}% ${primaryResetInfo ? `(${primaryResetInfo}重置)` : ''}</span>
-                                    <span>${cacheIcon}</span>
-                                </div>
-                                <div style="font-size: 14px; color: var(--text-light);">
-                                    周: ${secondaryPercent}% ${secondaryResetInfo ? `(${secondaryResetInfo}重置)` : ''}
-                                </div>
-                            </div>
-                        `;
-                    } else {
-                        usageText = `<div style="color: var(--warning); font-size: 12px; margin-top: 8px;">[查询失败]</div>`;
-                    }
-                    usageElement.innerHTML = usageText;
+                    renderUsageSummary(accountName, result.data);
                 } else {
                     usageElement.innerHTML = `<div style="color: var(--danger); font-size: 12px; margin-top: 8px;">[错误] ${result.error}</div>`;
                 }
@@ -1278,7 +1251,7 @@ class WebHandler(BaseHTTPRequestHandler):
         async function quickSave() {
             try {
                 setButtonLoading('quick-save-btn', true);
-                showMessage('正在备份当前账号...', 'success');
+                showMessage('正在导入当前账号...', 'success');
                 const response = await fetch('/api/quick_save', { method: 'POST' });
                 const result = await response.json();
                 if (result.success) {
@@ -1423,22 +1396,32 @@ class WebHandler(BaseHTTPRequestHandler):
         }
 
         async function refreshCurrentAccountUsage(accountName) {
+            const usageElement = document.getElementById(`usage-${accountName}`);
+            const previousHtml = usageElement ? usageElement.innerHTML : '';
+
             try {
                 showMessage(`正在刷新账号 ${accountName} 的用量数据...`, 'success');
+                if (usageElement) {
+                    usageElement.innerHTML = `<div style="color: var(--text-light); font-size: 12px; margin-top: 8px;">[刷新中]</div>`;
+                }
                 
                 const response = await fetch('/api/refresh_usage');
                 const result = await response.json();
                 
-                if (result.success) {
-                    showMessage(`${result.success}`);                    // 刷新成功后重新加载用量显示
-                    setTimeout(() => {
-                        loadAccountUsage(accountName);
-                    }, 500);
+                if (result.success && result.data) {
+                    renderUsageSummary(accountName, result.data);
+                    showMessage(`${result.success}`);
                 } else {
+                    if (usageElement) {
+                        usageElement.innerHTML = previousHtml;
+                    }
                     showMessage(result.error, 'error');
                 }
                 
             } catch (error) {
+                if (usageElement) {
+                    usageElement.innerHTML = previousHtml;
+                }
                 showMessage('刷新失败: ' + error.message, 'error');
             }
         }
@@ -1483,7 +1466,7 @@ def main():
     port = 8890
     server = HTTPServer(('localhost', port), create_handler(manager))
     
-    print(f"OpenAI Codex 账号管理器已启动")
+    print("Codex Switch 已启动")
     print(f"配置存储: {Path(__file__).parent / 'codex-config'}")
     print(f"请在浏览器中访问: http://localhost:{port}")
     print("按 Ctrl+C 退出")

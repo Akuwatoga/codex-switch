@@ -7,7 +7,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from usage_checker import extract_email_from_auth
+from codex_auth import build_account_record, extract_email_from_auth
 from config_utils import get_config_paths, generate_account_name
 
 
@@ -52,20 +52,18 @@ def backup_current_account(account_name=None):
                 account_name = "current_backup"
                 print("⚠️ 未能检测到邮箱，使用默认名称: current_backup")
         
-        # 添加保存时间戳
-        current_config['saved_at'] = datetime.now().isoformat()
-        current_config['account_name'] = account_name
-        
-        # 保存到accounts目录
+        saved_at = datetime.now().isoformat()
+        account_record = build_account_record(current_config, account_name, saved_at=saved_at)
+
         account_file = accounts_dir / f"{account_name}.json"
         with open(account_file, 'w', encoding='utf-8') as f:
-            json.dump(current_config, f, indent=2, ensure_ascii=False)
+            json.dump(account_record, f, indent=2, ensure_ascii=False)
         
         print(f"✅ 成功保存账号配置: {account_name}")
         print(f"📁 保存位置: {account_file}")
         
         # 显示账号信息
-        account_id = current_config.get('tokens', {}).get('account_id', '未知')
+        account_id = account_record.get('account_id') or account_record.get('tokens', {}).get('account_id', '未知')
         print(f"🔹 账号ID: {account_id}")
         
         return True

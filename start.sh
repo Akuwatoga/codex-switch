@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# OpenAI Codex 账号管理器快速启动脚本
+# Codex Switch quick start script
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "🚀 OpenAI Codex 账号管理器"
+echo "🚀 Codex Switch"
 echo "📁 项目目录: $SCRIPT_DIR"
 echo ""
 

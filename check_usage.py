@@ -10,6 +10,25 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from usage_checker import OpenAIUsageChecker, extract_access_token_from_auth, extract_email_from_auth
 from config_utils import get_config_paths
+
+
+def _limit_reset_time(limit):
+    if limit.get('resets_at') is not None:
+        return datetime.fromtimestamp(limit['resets_at'])
+    return datetime.now() + timedelta(seconds=limit.get('resets_in_seconds', 0))
+
+
+def _remaining_percent(limit):
+    used_percent = limit.get('used_percent')
+    if used_percent is None:
+        return None
+
+    try:
+        remaining_percent = 100 - float(used_percent)
+    except (TypeError, ValueError):
+        return None
+
+    return max(0.0, min(100.0, remaining_percent))
 import json
 
 
@@ -103,7 +122,7 @@ def check_usage(config_path=None, account_name=None, show_details=False):
         
         if is_current_account:
             # 当前账号：实时查询并保存到缓存
-            summary = checker.get_account_summary(email)
+            summary = checker.get_account_summary(email, auth_data=config)
         else:
             # 其他账号：只从缓存读取
             cached_data = checker.load_usage_data(email)
@@ -112,8 +131,10 @@ def check_usage(config_path=None, account_name=None, show_details=False):
                     "email": email,
                     "check_time": cached_data.get("check_time", ""),
                     "status": "success (cached)",
+                    "plan_type": cached_data.get("plan_type"),
                     "usage_data": cached_data.get("token_usage", {}),
                     "rate_limits": cached_data.get("rate_limits", {}),
+                    "additional_rate_limits": cached_data.get("additional_rate_limits", []),
                     "errors": cached_data.get("errors", []),
                     "from_cache": True
                 }
@@ -138,6 +159,8 @@ def check_usage(config_path=None, account_name=None, show_details=False):
             print(f"账号: {summary.get('email', '未知')}")
             print(f"状态: {summary.get('status', 'unknown')}")
             print(f"查询时间: {summary.get('check_time', '')}")
+            if summary.get('plan_type'):
+                print(f"计划: {summary.get('plan_type')}")
             
             # Token使用情况
             if summary.get('usage_data'):
@@ -154,14 +177,28 @@ def check_usage(config_path=None, account_name=None, show_details=False):
                 limits = summary['rate_limits']
                 if limits.get('primary'):
                     primary = limits['primary']
-                    reset_seconds = primary.get('resets_in_seconds', 0)
-                    reset_time = datetime.now() + timedelta(seconds=reset_seconds)
-                    print(f"5h限制: {primary.get('used_percent', 0):.1f}% (重置时间: {reset_time.strftime('%H:%M:%S')})")
+                    reset_time = _limit_reset_time(primary)
+                    remaining_percent = _remaining_percent(primary)
+                    print(f"5h剩余: {(remaining_percent if remaining_percent is not None else 0):.1f}% (重置时间: {reset_time.strftime('%H:%M:%S')})")
                 if limits.get('secondary'):
                     secondary = limits['secondary']
-                    reset_seconds = secondary.get('resets_in_seconds', 0)
-                    reset_time = datetime.now() + timedelta(seconds=reset_seconds)
-                    print(f"周限制: {secondary.get('used_percent', 0):.1f}% (重置时间: {reset_time.strftime('%m-%d %H:%M')})")
+                    reset_time = _limit_reset_time(secondary)
+                    remaining_percent = _remaining_percent(secondary)
+                    print(f"周剩余: {(remaining_percent if remaining_percent is not None else 0):.1f}% (重置时间: {reset_time.strftime('%m-%d %H:%M')})")
+
+            additional_limits = summary.get('additional_rate_limits') or []
+            if additional_limits:
+                print("附加额度:")
+                for item in additional_limits:
+                    name = item.get('limit_name') or '未知额度'
+                    primary = item.get('primary') or {}
+                    secondary = item.get('secondary') or {}
+                    primary_remaining = _remaining_percent(primary)
+                    secondary_remaining = _remaining_percent(secondary)
+                    print(
+                        f"  {name}: 5h剩余 {(primary_remaining if primary_remaining is not None else 0):.1f}% / "
+                        f"周剩余 {(secondary_remaining if secondary_remaining is not None else 0):.1f}%"
+                    )
             
             # 错误信息
             if summary.get('errors'):
@@ -233,14 +270,14 @@ def list_all_accounts():
                     limits = summary['rate_limits']
                     if limits.get('primary'):
                         primary = limits['primary']
-                        reset_seconds = primary.get('resets_in_seconds', 0)
-                        reset_time = datetime.now() + timedelta(seconds=reset_seconds)
-                        print(f"   5h限制: {primary.get('used_percent', 0):.1f}% ({reset_time.strftime('%H:%M')}重置)")
+                        reset_time = _limit_reset_time(primary)
+                        remaining_percent = _remaining_percent(primary)
+                        print(f"   5h剩余: {(remaining_percent if remaining_percent is not None else 0):.1f}% ({reset_time.strftime('%H:%M')}重置)")
                     if limits.get('secondary'):
                         secondary = limits['secondary']
-                        reset_seconds = secondary.get('resets_in_seconds', 0)
-                        reset_time = datetime.now() + timedelta(seconds=reset_seconds)
-                        print(f"   周限制: {secondary.get('used_percent', 0):.1f}% ({reset_time.strftime('%m-%d %H:%M')}重置)")
+                        reset_time = _limit_reset_time(secondary)
+                        remaining_percent = _remaining_percent(secondary)
+                        print(f"   周剩余: {(remaining_percent if remaining_percent is not None else 0):.1f}% ({reset_time.strftime('%m-%d %H:%M')}重置)")
             else:
                 print(f"❌ 查询失败")
                 if summary.get('errors'):

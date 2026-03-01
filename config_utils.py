@@ -2,11 +2,11 @@
 """
 配置工具模块
 
-Tauri 应用标识: com.codex.account-manager
+Tauri 应用标识: com.codex.switch
 应用配置目录:
-- macOS: ~/Library/Application Support/com.codex.account-manager
-- Windows: %APPDATA%/com.codex.account-manager
-- Linux: $XDG_CONFIG_HOME/com.codex.account-manager 或 ~/.config/com.codex.account-manager
+- macOS: ~/Library/Application Support/com.codex.switch
+- Windows: %APPDATA%/com.codex.switch
+- Linux: $XDG_CONFIG_HOME/com.codex.switch 或 ~/.config/com.codex.switch
 """
 
 import os
@@ -17,7 +17,7 @@ from pathlib import Path
 
 def _app_config_base_dir() -> Path:
     """获取与 Tauri 一致的应用配置基础目录"""
-    ident = "com.codex.account-manager"
+    ident = "com.codex.switch"
     if sys.platform == "darwin":  # macOS
         return Path.home() / "Library" / "Application Support" / ident
     if sys.platform.startswith("win"):

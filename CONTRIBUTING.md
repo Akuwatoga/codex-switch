@@ -1,6 +1,6 @@
 # 贡献指南
 
-感谢您对 OpenAI Codex 账号管理器项目的关注！我们欢迎各种形式的贡献，包括但不限于：
+感谢您对 Codex Switch 项目的关注！我们欢迎各种形式的贡献，包括但不限于：
 
 - 🐛 报告 Bug
 - 💡 提出新功能建议
@@ -15,8 +15,8 @@
 1. **Fork 和克隆仓库**
 ```bash
 # Fork 仓库到您的 GitHub 账户，然后克隆
-git clone https://github.com/your-username/codex-account-manager.git
-cd codex-account-manager
+git clone <repository-url>
+cd codex-switch
 ```
 
 2. **设置开发环境**
@@ -153,8 +153,8 @@ python3 codex_account_manager_web.py
 
 如果您在贡献过程中遇到问题：
 
-- 查看现有的 [Issues](https://github.com/your-username/codex-account-manager/issues)
-- 在 [Discussions](https://github.com/your-username/codex-account-manager/discussions) 中提问
+- 查看现有的 [Issues](../../issues)
+- 在 [Discussions](../../discussions) 中提问
 - 直接在 PR 中询问
 
 ## 📄 许可证

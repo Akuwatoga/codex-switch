@@ -8,6 +8,7 @@ import json
 import sys
 import shutil
 from pathlib import Path
+from codex_auth import extract_stored_auth, validate_auth_config
 from config_utils import get_config_paths
 
 
@@ -42,17 +43,17 @@ def switch_account(account_name):
             backup_file = auth_file.with_suffix('.json.backup')
             shutil.copy2(auth_file, backup_file)
             print(f"📦 已备份当前配置")
+        if system_auth_file.exists():
+            system_backup_file = system_auth_file.with_suffix('.json.backup')
+            shutil.copy2(system_auth_file, system_backup_file)
+            print(f"📦 已备份系统配置")
         
         # 读取目标账号配置
         with open(account_file, 'r', encoding='utf-8') as f:
             target_config = json.load(f)
-        
-        # 移除管理字段，只保留原始配置
-        clean_config = {
-            "OPENAI_API_KEY": target_config.get("OPENAI_API_KEY"),
-            "tokens": target_config.get("tokens"),
-            "last_refresh": target_config.get("last_refresh")
-        }
+
+        clean_config = extract_stored_auth(target_config)
+        validate_auth_config(clean_config)
         
         # 确保目录存在
         auth_file.parent.mkdir(exist_ok=True)
@@ -67,7 +68,7 @@ def switch_account(account_name):
         print(f"✅ 成功切换到账号: {account_name}")
         
         # 显示账号信息
-        account_id = target_config.get('tokens', {}).get('account_id', '未知')
+        account_id = target_config.get('account_id') or target_config.get('tokens', {}).get('account_id', '未知')
         print(f"🔹 账号ID: {account_id}")
         
         return True

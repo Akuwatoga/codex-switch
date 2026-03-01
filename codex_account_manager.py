@@ -10,7 +10,8 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from usage_checker import CodexUsageChecker, extract_email_from_auth
+from codex_auth import build_account_record, extract_account_id_from_auth, extract_email_from_auth, extract_stored_auth, validate_auth_config
+from usage_checker import CodexUsageChecker
 from config_utils import get_config_paths, generate_account_name
 
 
@@ -66,14 +67,11 @@ class CodexAccountManager:
         try:
             # 从系统 Codex 配置读取
             current_config = self._load_config(self.system_auth_file)
-            
-            # 添加保存时间戳
-            current_config['saved_at'] = datetime.now().isoformat()
-            current_config['account_name'] = account_name
+            account_record = build_account_record(current_config, account_name, saved_at=datetime.now().isoformat())
             
             # 保存到accounts目录
             account_file = self.accounts_dir / f"{account_name}.json"
-            if self._save_config(account_file, current_config):
+            if self._save_config(account_file, account_record):
                 print(f"✅ 成功保存账号配置: {account_name}")
                 print(f"📁 保存位置: {account_file}")
                 return True
@@ -87,13 +85,10 @@ class CodexAccountManager:
         """从提供的配置数据保存账号"""
         try:
             config = json.loads(config_data) if isinstance(config_data, str) else config_data
-            config.update({
-                'saved_at': datetime.now().isoformat(),
-                'account_name': account_name
-            })
+            account_record = build_account_record(config, account_name, saved_at=datetime.now().isoformat())
             
             account_file = self.accounts_dir / f"{account_name}.json"
-            if self._save_config(account_file, config):
+            if self._save_config(account_file, account_record):
                 print(f"✅ 成功保存账号配置: {account_name}")
                 return True
             return False
@@ -120,7 +115,7 @@ class CodexAccountManager:
                 
                 account_name = account_file.stem
                 saved_at = config.get('saved_at', '未知时间')
-                account_id = config.get('tokens', {}).get('account_id', '未知ID')
+                account_id = config.get('account_id') or extract_account_id_from_auth(config) or '未知ID'
                 
                 print(f"🔹 {account_name}")
                 print(f"   账号ID: {account_id}")
@@ -145,21 +140,20 @@ class CodexAccountManager:
         try:
             # 读取目标账号配置
             target_config = self._load_config(account_file)
+            clean_config = extract_stored_auth(target_config)
+            validate_auth_config(clean_config)
             
-            # 移除管理字段，只保留原始配置
-            clean_config = {
-                "OPENAI_API_KEY": target_config.get("OPENAI_API_KEY"),
-                "tokens": target_config.get("tokens"),
-                "last_refresh": target_config.get("last_refresh")
-            }
-            
+            if self.system_auth_file.exists():
+                backup_file = self.system_auth_file.with_suffix('.json.backup')
+                shutil.copy2(self.system_auth_file, backup_file)
+
             # 直接写入系统 Codex 配置
             self.system_auth_file.parent.mkdir(parents=True, exist_ok=True)
             if self._save_config(self.system_auth_file, clean_config):
                 print(f"✅ 成功切换到账号: {account_name}")
                 
                 # 显示账号信息
-                account_id = target_config.get('tokens', {}).get('account_id', '未知')
+                account_id = target_config.get('account_id') or extract_account_id_from_auth(target_config) or '未知'
                 print(f"🔹 账号ID: {account_id}")
                 print(f"📂 系统配置: {self.system_auth_file}")
                 return True
@@ -195,7 +189,7 @@ class CodexAccountManager:
         try:
             config = self._load_config(self.system_auth_file)
             
-            account_id = config.get('tokens', {}).get('account_id', '未知')
+            account_id = extract_account_id_from_auth(config) or '未知'
             last_refresh = config.get('last_refresh', '未知')
             
             print("\n🔄 当前活跃账号:")
@@ -238,8 +232,8 @@ class CodexAccountManager:
             checker = CodexUsageChecker()
             
             if force_refresh:
-                # 强制从session刷新
-                summary = checker.get_usage_summary(email)
+                # 强制从官方接口刷新
+                summary = checker.get_usage_summary(email, auth_data=config)
             else:
                 # 先尝试从缓存读取
                 cached_data = checker.load_usage_data(email)
@@ -249,14 +243,16 @@ class CodexAccountManager:
                         "email": email,
                         "check_time": cached_data.get("check_time", ""),
                         "status": "success",
+                        "plan_type": cached_data.get("plan_type"),
                         "token_usage": cached_data.get("token_usage", {}),
                         "rate_limits": cached_data.get("rate_limits", {}),
+                        "additional_rate_limits": cached_data.get("additional_rate_limits", []),
                         "errors": cached_data.get("errors", []),
                         "from_cache": True
                     }
                 else:
-                    print("⚠️ 没有缓存数据，请先用 codex 发送消息")
-                    print("💡 提示: 你可以选择菜单项进行强制刷新")
+                    print("⚠️ 没有缓存数据，请先切换到该账号后执行刷新")
+                    print("💡 提示: 刷新会直接查询官方用量接口")
                     return False
             
             # 显示格式化的结果
@@ -274,14 +270,14 @@ class CodexAccountManager:
 
 
 def main():
-    print("🚀 OpenAI Codex 账号管理器")
+    print("🚀 Codex Switch")
     print(f"📁 配置存储: {Path(__file__).parent / 'codex-config'}")
     
     manager = CodexAccountManager()
     
     while True:
         print("\n" + "=" * 50)
-        print("🚀 OpenAI Codex 账号管理器")
+        print("🚀 Codex Switch")
         print("=" * 50)
         print("1. 保存当前账号配置")
         print("2. 从配置内容添加账号")
@@ -291,7 +287,7 @@ def main():
         print("6. 显示当前账号")
         print("7. 查看当前账号用量（缓存）")
         print("8. 查看指定账号用量（缓存）")
-        print("9. 刷新当前账号用量（从session）")
+        print("9. 刷新当前账号用量（官方接口）")
         print("0. 退出")
         print("-" * 50)
         

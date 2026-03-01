@@ -1,6 +1,7 @@
 // Tauri API 导入
-import { readTextFile, writeTextFile, readDir, mkdir, exists, remove, stat } from '@tauri-apps/plugin-fs';
+import { readTextFile, writeTextFile, readDir, mkdir, exists, remove } from '@tauri-apps/plugin-fs';
 import { homeDir, join, appDataDir } from '@tauri-apps/api/path';
+import { invoke } from '@tauri-apps/api/core';
 import { message, ask, confirm } from '@tauri-apps/plugin-dialog';
 
 // 全局状态
@@ -8,6 +9,28 @@ let selectedAccount = null;
 let accounts = [];
 let isLoading = false;
 let PATHS = {};
+let appSettings = {
+    maxLogEntries: 500,
+    proxy: {
+        proxyUrl: ''
+    },
+    settingsVersion: 3
+};
+let appLogs = [];
+let logWriteQueue = Promise.resolve();
+const MANAGER_KEY = '_manager';
+const MANAGER_FIELDS = new Set(['saved_at', 'account_name', 'email', 'account_id', 'plan', MANAGER_KEY]);
+const DEFAULT_SETTINGS = {
+    maxLogEntries: 500,
+    proxy: {
+        proxyUrl: ''
+    },
+    settingsVersion: 3
+};
+
+function cloneJson(data) {
+    return data === undefined ? undefined : JSON.parse(JSON.stringify(data));
+}
 
 // =============================================================================
 // 工具函数 - Base64URL 解码 (与 Python base64.b64decode 一致)
@@ -50,17 +73,24 @@ function parseJwtPayload(token) {
 }
 
 function extractEmailFromToken(config) {
-    if (!config || !config.tokens) return null;
+    if (!config || typeof config !== 'object') return null;
+
+    const manager = config[MANAGER_KEY];
+    if (manager?.email) return manager.email;
+    if (config.email) return config.email;
+
+    const authConfig = extractStoredAuth(config);
+    if (!authConfig.tokens) return null;
     
     // 优先从 id_token 提取
-    if (config.tokens.id_token) {
-        const payload = parseJwtPayload(config.tokens.id_token);
+    if (authConfig.tokens.id_token) {
+        const payload = parseJwtPayload(authConfig.tokens.id_token);
         if (payload && payload.email) return payload.email;
     }
     
     // 备用：从 access_token 提取
-    if (config.tokens.access_token) {
-        const payload = parseJwtPayload(config.tokens.access_token);
+    if (authConfig.tokens.access_token) {
+        const payload = parseJwtPayload(authConfig.tokens.access_token);
         if (payload) {
             if (payload.email) return payload.email;
             // OpenAI特定字段
@@ -71,6 +101,167 @@ function extractEmailFromToken(config) {
     }
     
     return config.email || null;
+}
+
+function extractStoredAuth(config) {
+    if (!config || typeof config !== 'object') return {};
+
+    const manager = config[MANAGER_KEY];
+    if (manager?.auth_snapshot && typeof manager.auth_snapshot === 'object') {
+        return stripManagerFields(manager.auth_snapshot);
+    }
+
+    return stripManagerFields(config);
+}
+
+function extractAccessToken(config) {
+    const authConfig = extractStoredAuth(config);
+    const accessToken = authConfig?.tokens?.access_token;
+    return typeof accessToken === 'string' && accessToken ? accessToken : null;
+}
+
+function getActiveProxyConfig() {
+    const proxy = appSettings?.proxy || {};
+    return {
+        proxyUrl: normalizeProxyUrl(proxy.proxyUrl)
+    };
+}
+
+function normalizeProxyUrl(value) {
+    if (typeof value !== 'string') return '';
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    return /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+}
+
+function stripManagerFields(config) {
+    if (!config || typeof config !== 'object') return {};
+
+    return Object.fromEntries(
+        Object.entries(config)
+            .filter(([key]) => !MANAGER_FIELDS.has(key))
+            .map(([key, value]) => [key, cloneJson(value)])
+    );
+}
+
+function extractAccountId(config) {
+    if (!config || typeof config !== 'object') return null;
+
+    const manager = config[MANAGER_KEY];
+    if (manager?.account_id) return String(manager.account_id);
+    if (config.account_id) return String(config.account_id);
+
+    const authConfig = extractStoredAuth(config);
+    const tokens = authConfig.tokens || {};
+
+    for (const key of ['account_id', 'chatgpt_account_id', 'user_id']) {
+        if (tokens[key]) return String(tokens[key]);
+    }
+
+    for (const tokenKey of ['access_token', 'id_token']) {
+        const payload = parseJwtPayload(tokens[tokenKey]);
+        if (!payload) continue;
+
+        const authClaims = payload['https://api.openai.com/auth'];
+        if (authClaims && typeof authClaims === 'object') {
+            for (const key of ['chatgpt_account_id', 'account_id', 'user_id', 'chatgpt_user_id']) {
+                if (authClaims[key]) return String(authClaims[key]);
+            }
+        }
+
+        for (const key of ['sub', 'user_id']) {
+            if (payload[key]) return String(payload[key]);
+        }
+    }
+
+    return null;
+}
+
+function sameAccount(left, right) {
+    const leftAuth = extractStoredAuth(left);
+    const rightAuth = extractStoredAuth(right);
+
+    if (!Object.keys(leftAuth).length || !Object.keys(rightAuth).length) {
+        return false;
+    }
+
+    const leftId = extractAccountId(leftAuth);
+    const rightId = extractAccountId(rightAuth);
+    if (leftId && rightId) {
+        return leftId === rightId;
+    }
+
+    const leftTokens = leftAuth.tokens || {};
+    const rightTokens = rightAuth.tokens || {};
+    for (const key of ['refresh_token', 'id_token', 'access_token']) {
+        if (leftTokens[key] && rightTokens[key]) {
+            return leftTokens[key] === rightTokens[key];
+        }
+    }
+
+    const leftEmail = extractEmailFromToken(leftAuth);
+    const rightEmail = extractEmailFromToken(rightAuth);
+    if (leftEmail && rightEmail) {
+        return leftEmail === rightEmail;
+    }
+
+    return false;
+}
+
+function validateAuthConfig(config) {
+    if (!config || typeof config !== 'object') {
+        throw new Error('账号配置格式无效');
+    }
+
+    const authMode = config.auth_mode;
+    const tokens = config.tokens;
+    const apiKey = config.OPENAI_API_KEY;
+
+    if (authMode === 'api_key') {
+        if (!apiKey) {
+            throw new Error('API Key 账号缺少 OPENAI_API_KEY');
+        }
+        return;
+    }
+
+    if (tokens && typeof tokens === 'object') {
+        if (tokens.refresh_token || tokens.access_token || tokens.id_token) {
+            return;
+        }
+    }
+
+    if (apiKey) {
+        return;
+    }
+
+    throw new Error('账号配置缺少可用的认证字段');
+}
+
+function buildStoredAccountRecord(authConfig, accountName) {
+    const authSnapshot = extractStoredAuth(authConfig);
+    validateAuthConfig(authSnapshot);
+
+    const metadata = {
+        schema_version: 2,
+        account_name: accountName,
+        saved_at: new Date().toISOString(),
+        email: extractEmailFromToken(authSnapshot),
+        account_id: extractAccountId(authSnapshot),
+        plan: extractPlanType(authSnapshot),
+        auth_mode: authSnapshot.auth_mode || null,
+        auth_snapshot: cloneJson(authSnapshot)
+    };
+
+    return {
+        ...cloneJson(authSnapshot),
+        account_name: metadata.account_name,
+        saved_at: metadata.saved_at,
+        email: metadata.email,
+        account_id: metadata.account_id,
+        plan: metadata.plan,
+        auth_mode: metadata.auth_mode,
+        [MANAGER_KEY]: metadata
+    };
 }
 
 // =============================================================================
@@ -92,7 +283,8 @@ async function initPaths() {
         codexConfigDir,
         accountsDir: await join(codexConfigDir, 'accounts'),
         usageCacheDir: await join(codexConfigDir, 'usage_cache'),
-        sessionDir: await join(home, '.codex', 'sessions')
+        settingsFile: await join(codexConfigDir, 'settings.json'),
+        logsFile: await join(codexConfigDir, 'error_logs.json')
     };
     
     console.log('初始化路径:', PATHS);
@@ -113,6 +305,233 @@ async function ensureDirs() {
     }
 }
 
+async function readJsonFileNoThrow(path) {
+    try {
+        const fileExists = await exists(path);
+        if (!fileExists) return null;
+        const content = await readTextFile(path);
+        return JSON.parse(content);
+    } catch (_) {
+        return null;
+    }
+}
+
+async function writeJsonFileNoThrow(path, data) {
+    try {
+        await writeTextFile(path, JSON.stringify(data, null, 2));
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+function normalizeSettings(rawSettings) {
+    const maxLogEntries = Number(rawSettings?.maxLogEntries);
+    const legacyProxyValues = rawSettings?.proxy && typeof rawSettings.proxy === 'object'
+        ? Object.entries(rawSettings.proxy)
+            .filter(([key, value]) => key !== 'proxyUrl' && typeof value === 'string' && value.trim())
+            .map(([, value]) => value)
+        : [];
+    const proxyUrl = normalizeProxyUrl(
+        rawSettings?.proxy?.proxyUrl ||
+        legacyProxyValues[0] ||
+        ''
+    );
+
+    return {
+        maxLogEntries: Number.isFinite(maxLogEntries)
+            ? Math.max(50, Math.min(5000, Math.round(maxLogEntries)))
+            : DEFAULT_SETTINGS.maxLogEntries,
+        proxy: {
+            proxyUrl
+        },
+        settingsVersion: DEFAULT_SETTINGS.settingsVersion
+    };
+}
+
+async function loadSettings() {
+    const storedSettings = await readJsonFileNoThrow(PATHS.settingsFile);
+    appSettings = normalizeSettings(storedSettings || DEFAULT_SETTINGS);
+}
+
+async function saveSettings() {
+    await writeJsonFileNoThrow(PATHS.settingsFile, appSettings);
+}
+
+function trimLogs(logs) {
+    const maxEntries = appSettings.maxLogEntries || DEFAULT_SETTINGS.maxLogEntries;
+    if (!Array.isArray(logs)) return [];
+    return logs.slice(-maxEntries);
+}
+
+async function loadAppLogs() {
+    const storedLogs = await readJsonFileNoThrow(PATHS.logsFile);
+    appLogs = trimLogs(Array.isArray(storedLogs?.logs) ? storedLogs.logs : []);
+}
+
+async function persistLogs() {
+    const payload = {
+        logs: trimLogs(appLogs)
+    };
+    appLogs = payload.logs;
+    await writeJsonFileNoThrow(PATHS.logsFile, payload);
+}
+
+function serializeErrorDetails(details) {
+    if (details instanceof Error) {
+        return {
+            name: details.name,
+            message: details.message,
+            stack: details.stack || null
+        };
+    }
+
+    if (details === undefined || details === null) {
+        return null;
+    }
+
+    if (typeof details === 'string') {
+        return { message: details };
+    }
+
+    try {
+        return JSON.parse(JSON.stringify(details));
+    } catch (_) {
+        return { message: String(details) };
+    }
+}
+
+function enqueueLogWrite() {
+    logWriteQueue = logWriteQueue
+        .then(() => persistLogs())
+        .catch(() => {});
+    return logWriteQueue;
+}
+
+function appendLogEntry(level, message, details = null) {
+    const entry = {
+        id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+        timestamp: new Date().toISOString(),
+        level,
+        message,
+        details: serializeErrorDetails(details)
+    };
+
+    appLogs.push(entry);
+    appLogs = trimLogs(appLogs);
+    enqueueLogWrite();
+    renderSettingsLogs();
+    return entry;
+}
+
+function formatLogEntry(entry) {
+    const time = entry?.timestamp
+        ? new Date(entry.timestamp).toLocaleString('zh-CN')
+        : '-';
+    const base = `[${time}] [${String(entry?.level || 'info').toUpperCase()}] ${entry?.message || ''}`;
+    const details = entry?.details
+        ? JSON.stringify(entry.details, null, 2)
+        : '';
+    return details ? `${base}\n${details}` : base;
+}
+
+function renderSettingsLogs() {
+    const logContent = document.getElementById('settings-log-content');
+    const logEntryCount = document.getElementById('log-entry-count');
+    const lastErrorTime = document.getElementById('last-error-time');
+    const logFilePath = document.getElementById('log-file-path');
+    const maxLogEntries = document.getElementById('max-log-entries');
+    const proxyUrl = document.getElementById('proxy-url');
+
+    if (logEntryCount) {
+        logEntryCount.textContent = String(appLogs.length);
+    }
+
+    const latestError = [...appLogs].reverse().find((entry) => entry.level === 'error');
+    if (lastErrorTime) {
+        lastErrorTime.textContent = latestError
+            ? new Date(latestError.timestamp).toLocaleString('zh-CN')
+            : '-';
+    }
+
+    if (logFilePath) {
+        logFilePath.textContent = PATHS.logsFile || '-';
+    }
+
+    if (maxLogEntries) {
+        maxLogEntries.value = String(appSettings.maxLogEntries);
+    }
+
+    if (proxyUrl) {
+        proxyUrl.value = appSettings.proxy?.proxyUrl || '';
+    }
+
+    if (logContent) {
+        logContent.textContent = appLogs.length
+            ? appLogs.map(formatLogEntry).join('\n\n')
+            : '暂无日志';
+    }
+}
+
+function openSettingsModal() {
+    const overlay = document.getElementById('settings-overlay');
+    if (!overlay) return;
+    renderSettingsLogs();
+    overlay.style.display = 'flex';
+}
+
+function closeSettingsModal() {
+    const overlay = document.getElementById('settings-overlay');
+    if (!overlay) return;
+    overlay.style.display = 'none';
+}
+
+function handleSettingsOverlayClick(event) {
+    if (event.target?.id === 'settings-overlay') {
+        closeSettingsModal();
+    }
+}
+
+async function saveSettingsModal() {
+    const input = document.getElementById('max-log-entries');
+    const proxyUrl = document.getElementById('proxy-url');
+    const nextValue = Number(input?.value);
+    appSettings = normalizeSettings({
+        maxLogEntries: nextValue,
+        proxy: {
+            proxyUrl: proxyUrl?.value || ''
+        }
+    });
+    appLogs = trimLogs(appLogs);
+    await saveSettings();
+    await persistLogs();
+    renderSettingsLogs();
+    showMessage('设置已保存', 'success');
+}
+
+async function refreshSettingsLogs() {
+    await loadAppLogs();
+    renderSettingsLogs();
+    showMessage('日志已刷新', 'success');
+}
+
+async function clearErrorLogs() {
+    const confirmed = await confirm('确定要清空本地错误日志吗？此操作不可恢复。', {
+        title: '清空日志',
+        okLabel: '清空',
+        cancelLabel: '取消'
+    });
+
+    if (!confirmed) {
+        return;
+    }
+
+    appLogs = [];
+    await persistLogs();
+    renderSettingsLogs();
+    showMessage('错误日志已清空', 'success');
+}
+
 // =============================================================================
 // JSON 文件读写 (与 Python json.load/dump 一致)
 // =============================================================================
@@ -126,6 +545,7 @@ async function readJsonSafe(path) {
         return JSON.parse(content);
     } catch (e) {
         console.error(`读取JSON失败 ${path}:`, e);
+        appendLogEntry('error', '读取 JSON 文件失败', { path, error: serializeErrorDetails(e) });
         return null;
     }
 }
@@ -137,6 +557,7 @@ async function writeJsonSafe(path, data) {
         return true;
     } catch (e) {
         console.error(`写入JSON失败 ${path}:`, e);
+        appendLogEntry('error', '写入 JSON 文件失败', { path, error: serializeErrorDetails(e) });
         throw e;
     }
 }
@@ -163,11 +584,9 @@ async function loadAccounts() {
         accounts = [];
         
         // 获取当前账号邮箱
-        let currentEmail = null;
         const currentConfig = await readJsonSafe(PATHS.systemAuthFile);
         if (currentConfig) {
-            currentEmail = extractEmailFromToken(currentConfig);
-            console.log('当前账号邮箱:', currentEmail);
+            console.log('当前账号邮箱:', extractEmailFromToken(currentConfig));
         } else {
             console.log('未找到系统auth文件');
         }
@@ -183,13 +602,15 @@ async function loadAccounts() {
                     const email = extractEmailFromToken(config) || '未知';
                     const planType = extractPlanType(config) || '未知';
                     const savedAt = config.saved_at || '未知时间';
-                    const isCurrent = currentEmail && email === currentEmail;
+                    const isCurrent = sameAccount(currentConfig, config);
+                    const accountId = extractAccountId(config);
                     
-                    console.log(`账号: ${accountName}, Email: ${email}, 是否当前: ${isCurrent}`);
+                    console.log(`账号: ${accountName}, Email: ${email}, AccountId: ${accountId}, 是否当前: ${isCurrent}`);
                     
                     accounts.push({
                         name: accountName,
                         email,
+                        account_id: accountId,
                         plan: planType,
                         saved_at: formatDate(savedAt),
                         is_current: isCurrent,
@@ -221,9 +642,16 @@ async function loadAccounts() {
 
 function extractPlanType(config) {
     try {
-        if (!config || !config.tokens || !config.tokens.access_token) return null;
+        if (!config || typeof config !== 'object') return null;
+
+        const manager = config[MANAGER_KEY];
+        if (manager?.plan) return manager.plan;
+        if (config.plan) return config.plan;
+
+        const authConfig = extractStoredAuth(config);
+        if (!authConfig.tokens || !authConfig.tokens.access_token) return null;
         
-        const payload = parseJwtPayload(config.tokens.access_token);
+        const payload = parseJwtPayload(authConfig.tokens.access_token);
         if (payload && payload['https://api.openai.com/auth']) {
             return payload['https://api.openai.com/auth'].chatgpt_plan_type;
         }
@@ -365,7 +793,7 @@ function handleRefreshClick(event, accountName) {
 async function quickSave() {
     try {
         setButtonLoading('quick-save-btn', true);
-        showMessage('正在备份当前账号...', 'success');
+        showMessage('正在导入当前账号...', 'success');
         
         const config = await readJsonSafe(PATHS.systemAuthFile);
         if (!config) {
@@ -378,12 +806,9 @@ async function quickSave() {
         }
         
         const accountName = generateAccountName(email);
-        config.saved_at = new Date().toISOString();
-        config.account_name = accountName;
-        config.email = email;
-        
+        const accountRecord = buildStoredAccountRecord(config, accountName);
         const accountFile = await join(PATHS.accountsDir, `${accountName}.json`);
-        await writeJsonSafe(accountFile, config);
+        await writeJsonSafe(accountFile, accountRecord);
         
         showMessage(`成功保存账号: ${accountName} (${email})`, 'success');
         await loadAccounts();
@@ -428,18 +853,19 @@ async function quickSwitchAccount(accountName) {
         
         console.log('账号配置:', account.config);
         
-        // 清理配置只保留必要字段 (与Python一致)
-        const cleanConfig = {
-            OPENAI_API_KEY: account.config.OPENAI_API_KEY,
-            tokens: account.config.tokens,
-            last_refresh: account.config.last_refresh
-        };
+        const cleanConfig = extractStoredAuth(account.config);
+        validateAuthConfig(cleanConfig);
+
+        const currentSystemConfig = await readJsonSafe(PATHS.systemAuthFile);
+        if (currentSystemConfig) {
+            await writeJsonSafe(`${PATHS.systemAuthFile}.backup`, currentSystemConfig);
+        }
         
         console.log('准备写入系统配置:', PATHS.systemAuthFile);
         await writeJsonSafe(PATHS.systemAuthFile, cleanConfig);
         console.log('✅ 系统配置写入成功');
         
-        showMessage(`已切换到账号 ${accountName}，请用 codex 发送消息后刷新用量`, 'success');
+        showMessage(`已切换到账号 ${accountName}，现在可以直接刷新官方用量`, 'success');
         selectedAccount = null;
         await loadAccounts();
     } catch (e) {
@@ -491,120 +917,6 @@ async function quickDeleteAccount(accountName) {
 // 用量查询功能 (完整实现)
 // =============================================================================
 
-// 查找最新的 session 文件
-async function findLatestSessionFile() {
-    try {
-        const sessionDir = PATHS.sessionDir;
-        const sessionExists = await exists(sessionDir);
-        if (!sessionExists) return null;
-
-        // 递归查找所有 rollout-*.jsonl 文件
-        const files = await findRolloutFiles(sessionDir);
-        console.log('🧾 session 文件数量:', files.length);
-        if (files.length > 0) {
-            console.log('🧾 最近候选文件(前3):', files.slice(0, 3).map(f => f.path));
-        }
-        if (files.length === 0) return null;
-
-        // 按修改时间排序（最新的在前）
-        files.sort((a, b) => b.mtime - a.mtime);
-
-        // 检查最近10个文件，找到包含 token_count 数据的
-        for (const file of files.slice(0, 10)) {
-            if (await hasTokenCountData(file.path)) {
-                console.log('✅ 选用含 token_count 的文件:', file.path);
-                return file.path;
-            }
-        }
-
-        console.log('⚠️ 未找到包含 token_count 的文件，回退到最新文件:', files[0]?.path);
-        return files[0]?.path || null;
-    } catch (e) {
-        console.error('查找 session 文件失败:', e);
-        return null;
-    }
-}
-
-// 递归查找 rollout-*.jsonl 文件
-async function findRolloutFiles(dir) {
-  const result = [];
-  try {
-    const entries = await readDir(dir);
-    for (const entry of entries) {
-      const fullPath = await join(dir, entry.name);
-      if (entry.isDirectory) {
-        // 递归查找子目录
-        const subFiles = await findRolloutFiles(fullPath);
-        result.push(...subFiles);
-      } else if (entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl')) {
-        // 这是我们要找的文件，读取真实修改时间用于排序（与 Python 一致）
-        let mtime = 0;
-        try {
-          const info = await stat(fullPath);
-          // 兼容不同字段命名
-          if (typeof info.mtimeMs === 'number') mtime = info.mtimeMs;
-          else if (typeof info.modifiedAt === 'number') mtime = info.modifiedAt;
-          else if (info.mtime) mtime = Number(info.mtime) || 0;
-        } catch (_) {
-          mtime = 0;
-        }
-        result.push({ path: fullPath, mtime });
-      }
-    }
-  } catch (e) {
-    // 忽略权限错误
-  }
-  return result.sort((a, b) => b.mtime - a.mtime);
-}
-
-// 检查文件是否包含 token_count 数据
-async function hasTokenCountData(filePath) {
-    try {
-        const content = await readTextFile(filePath);
-        const lines = content.split('\n').filter(line => line.trim());
-        // 只检查最后20行
-        const lastLines = lines.slice(-20);
-        for (const line of lastLines.reverse()) {
-            try {
-                const data = JSON.parse(line);
-                if (data.payload?.type === 'token_count') {
-                    return true;
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-        return false;
-    } catch (e) {
-        return false;
-    }
-}
-
-// 解析 session 文件获取用量数据
-async function parseSessionFile(filePath) {
-    try {
-        const content = await readTextFile(filePath);
-        const lines = content.split('\n').filter(line => line.trim());
-        
-        // 从后往前查找最新的 token_count 事件
-        for (const line of lines.reverse()) {
-            try {
-                const data = JSON.parse(line);
-                const payload = data.payload;
-                if (payload?.type === 'token_count' && payload.rate_limits) {
-                    return data;
-                }
-            } catch (e) {
-                continue;
-            }
-        }
-        return null;
-    } catch (e) {
-        console.error('解析 session 文件失败:', e);
-        return null;
-    }
-}
-
 // 加载缓存的用量数据
 async function loadCachedUsage(email) {
     if (!email) return null;
@@ -654,54 +966,174 @@ async function saveCachedUsage(email, usageData) {
     }
 }
 
+function normalizeWindow(windowData) {
+    if (!windowData || typeof windowData !== 'object') return null;
+
+    const usedPercent = Number(windowData.used_percent);
+    const limitWindowSeconds = Number(windowData.limit_window_seconds);
+    const resetsAt = Number(windowData.reset_at);
+    const resetsInSeconds = Number(windowData.reset_after_seconds);
+
+    return {
+        used_percent: Number.isFinite(usedPercent) ? usedPercent : null,
+        window_minutes: Number.isFinite(limitWindowSeconds) ? limitWindowSeconds / 60 : null,
+        limit_window_seconds: Number.isFinite(limitWindowSeconds) ? limitWindowSeconds : null,
+        resets_at: Number.isFinite(resetsAt) ? resetsAt : null,
+        resets_in_seconds: Number.isFinite(resetsInSeconds) ? resetsInSeconds : null
+    };
+}
+
+function normalizeRateLimit(rateLimit) {
+    if (!rateLimit || typeof rateLimit !== 'object') return {};
+
+    const normalized = {
+        allowed: rateLimit.allowed,
+        limit_reached: rateLimit.limit_reached
+    };
+
+    const primary = normalizeWindow(rateLimit.primary_window);
+    const secondary = normalizeWindow(rateLimit.secondary_window);
+    if (primary) normalized.primary = primary;
+    if (secondary) normalized.secondary = secondary;
+    return normalized;
+}
+
+function normalizeAdditionalRateLimits(additionalRateLimits) {
+    if (!Array.isArray(additionalRateLimits)) return [];
+
+    return additionalRateLimits
+        .map((item) => {
+            if (!item || typeof item !== 'object') return null;
+            const rateLimit = normalizeRateLimit(item.rate_limit);
+            if (!Object.keys(rateLimit).length) return null;
+
+            return {
+                limit_name: item.limit_name || null,
+                metered_feature: item.metered_feature || null,
+                allowed: rateLimit.allowed,
+                limit_reached: rateLimit.limit_reached,
+                primary: rateLimit.primary || null,
+                secondary: rateLimit.secondary || null
+            };
+        })
+        .filter(Boolean);
+}
+
+async function readSystemAuthConfig() {
+    const authExists = await exists(PATHS.systemAuthFile);
+    if (!authExists) return null;
+    return readJsonSafe(PATHS.systemAuthFile);
+}
+
+async function fetchWhamUsage(accessToken) {
+    if (!accessToken) {
+        throw new Error('当前账号缺少 access_token');
+    }
+
+    return invoke('fetch_wham_usage', {
+        accessToken,
+        proxyConfig: getActiveProxyConfig()
+    });
+}
+
 // 获取用量摘要
-async function getUsageSummary(email) {
+async function getUsageSummary(email, authConfig = null) {
     const summary = {
         check_time: new Date().toLocaleString('zh-CN'),
         status: 'checking',
+        email: email || null,
+        plan_type: null,
         token_usage: {},
         rate_limits: {},
+        additional_rate_limits: [],
         errors: []
     };
-    
-    const sessionFile = await findLatestSessionFile();
-    if (!sessionFile) {
-        summary.errors.push('未找到 Codex CLI session 文件');
+
+    const activeAuth = authConfig || await readSystemAuthConfig();
+    if (!activeAuth) {
+        summary.errors.push('未找到当前 Codex 认证配置');
         summary.status = 'failed';
         return summary;
     }
-    console.log('📄 使用的 session 文件:', sessionFile);
-    
-    const tokenData = await parseSessionFile(sessionFile);
-    if (!tokenData) {
-        summary.errors.push('未找到有效的用量数据，请先使用 codex 发送消息');
+
+    const accessToken = extractAccessToken(activeAuth);
+    if (!accessToken) {
+        summary.errors.push('当前账号缺少 access_token');
         summary.status = 'failed';
         return summary;
     }
-    
-    const payload = tokenData.payload;
-    const info = payload.info;
-    
-    if (info && info.total_token_usage) {
-        summary.token_usage = info.total_token_usage;
+
+    const resolvedEmail = email || extractEmailFromToken(activeAuth);
+    if (resolvedEmail) {
+        summary.email = resolvedEmail;
     }
-    
-    if (payload.rate_limits) {
-        summary.rate_limits = payload.rate_limits;
+
+    try {
+        const payload = await fetchWhamUsage(accessToken);
+        summary.status = 'success';
+        summary.email = summary.email || payload?.email || null;
+        summary.plan_type = payload?.plan_type || null;
+        summary.rate_limits = normalizeRateLimit(payload?.rate_limit);
+        summary.additional_rate_limits = normalizeAdditionalRateLimits(payload?.additional_rate_limits);
+        summary.raw_usage = payload;
+    } catch (error) {
+        const errorMessage = error?.message || String(error);
+        summary.errors.push(errorMessage);
+        summary.status = 'failed';
+        appendLogEntry('error', '获取官方用量接口失败', {
+            email: summary.email,
+            error: errorMessage
+        });
+        return summary;
     }
-    
-    summary.status = 'success';
-    
-    // 保存到缓存
-    if (email && summary.status === 'success') {
-        await saveCachedUsage(email, {
+
+    if (summary.email && summary.status === 'success') {
+        await saveCachedUsage(summary.email, {
             check_time: summary.check_time,
+            status: summary.status,
+            plan_type: summary.plan_type,
             token_usage: summary.token_usage,
-            rate_limits: summary.rate_limits
+            rate_limits: summary.rate_limits,
+            additional_rate_limits: summary.additional_rate_limits,
+            raw_usage: summary.raw_usage,
+            errors: summary.errors
         });
     }
-    
+
     return summary;
+}
+
+function getResetDate(limit) {
+    if (!limit || typeof limit !== 'object') return null;
+
+    if (typeof limit.resets_at === 'number') {
+        return new Date(limit.resets_at * 1000);
+    }
+
+    if (typeof limit.resets_in_seconds === 'number') {
+        return new Date(Date.now() + limit.resets_in_seconds * 1000);
+    }
+
+    return null;
+}
+
+function formatResetInfo(limit, includeDate = false) {
+    const resetDate = getResetDate(limit);
+    if (!resetDate || Number.isNaN(resetDate.getTime())) return '';
+
+    if (includeDate) {
+        return `${resetDate.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})} ${resetDate.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`;
+    }
+
+    return resetDate.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
+}
+
+function getRemainingPercent(limit) {
+    const usedPercent = Number(limit?.used_percent);
+    if (!Number.isFinite(usedPercent)) return null;
+
+    const remainingPercent = 100 - usedPercent;
+    return Math.max(0, Math.min(100, Math.round(remainingPercent)));
 }
 
 // 格式化用量单元格 HTML
@@ -710,7 +1142,7 @@ function formatUsageCell(percent, resetInfo, fromCache = false) {
         return '<span class="usage-text" style="color: var(--text-muted);">-</span>';
     }
     
-    const barClass = percent > 80 ? 'high' : percent > 60 ? 'medium' : 'low';
+    const barClass = percent < 20 ? 'high' : percent < 40 ? 'medium' : 'low';
     const cacheIndicator = fromCache ? ' <span class="cache-badge" title="缓存数据">缓存</span>' : '';
     
     return `
@@ -724,71 +1156,98 @@ function formatUsageCell(percent, resetInfo, fromCache = false) {
     `;
 }
 
+function getUsageCells(accountName) {
+    return {
+        primaryCell: document.getElementById(`usage-primary-${accountName}`),
+        secondaryCell: document.getElementById(`usage-secondary-${accountName}`)
+    };
+}
+
+function renderEmptyUsageCell(cell, text = '-', colorVar = '--text-muted') {
+    if (!cell) return;
+    cell.innerHTML = `<span class="usage-text" style="color: var(${colorVar});">${text}</span>`;
+}
+
+function renderUsageLoading(accountName) {
+    const { primaryCell, secondaryCell } = getUsageCells(accountName);
+    renderEmptyUsageCell(primaryCell, '刷新中...', '--text-muted');
+    renderEmptyUsageCell(secondaryCell, '刷新中...', '--text-muted');
+}
+
+function renderUsageRateLimits(accountName, rateLimits, fromCache = false) {
+    const { primaryCell, secondaryCell } = getUsageCells(accountName);
+    if (!primaryCell || !secondaryCell) return false;
+
+    const primary = rateLimits?.primary;
+    const secondary = rateLimits?.secondary;
+
+    if (primary) {
+        const percent = getRemainingPercent(primary);
+        const resetInfo = formatResetInfo(primary, false);
+        primaryCell.innerHTML = formatUsageCell(percent, resetInfo, fromCache);
+    } else {
+        renderEmptyUsageCell(primaryCell);
+    }
+
+    if (secondary) {
+        const percent = getRemainingPercent(secondary);
+        const resetInfo = formatResetInfo(secondary, true);
+        secondaryCell.innerHTML = formatUsageCell(percent, resetInfo, fromCache);
+    } else {
+        renderEmptyUsageCell(secondaryCell);
+    }
+
+    return true;
+}
+
 // 加载账号用量 (表格版本)
-async function loadAccountUsage(accountName) {
-    const primaryCell = document.getElementById(`usage-primary-${accountName}`);
-    const secondaryCell = document.getElementById(`usage-secondary-${accountName}`);
-    
-    if (!primaryCell || !secondaryCell) return;
-    
+async function loadAccountUsage(accountName, options = {}) {
     const account = accounts.find(a => a.name === accountName);
     if (!account) return;
-    
+
+    const {
+        preloadedSummary = null,
+        allowCacheFallback = true,
+        skipLiveFetch = false
+    } = options;
+
     try {
-        // 所有账号都首先尝试从缓存读取
-        const cachedUsage = await loadCachedUsage(account.email);
-        
-        if (cachedUsage) {
-            // 使用缓存数据
-            const primary = cachedUsage.rate_limits?.primary;
-            const secondary = cachedUsage.rate_limits?.secondary;
-            
-            if (primary) {
-                const percent = parseInt(primary.used_percent) || 0;
-                const resetTime = new Date(Date.now() + (primary.resets_in_seconds || 0) * 1000);
-                const resetInfo = resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-                primaryCell.innerHTML = formatUsageCell(percent, resetInfo, true);
-            }
-            
-            if (secondary) {
-                const percent = parseInt(secondary.used_percent) || 0;
-                const resetTime = new Date(Date.now() + (secondary.resets_in_seconds || 0) * 1000);
-                const resetInfo = `${resetTime.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})} ${resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`;
-                secondaryCell.innerHTML = formatUsageCell(percent, resetInfo, true);
-            }
-        } else {
-            // 只有当前账号才会尝试实时查询
-            if (account.is_current) {
-                const summary = await getUsageSummary(account.email);
-                if (summary.status === 'success' && summary.rate_limits) {
-                    const primary = summary.rate_limits.primary;
-                    const secondary = summary.rate_limits.secondary;
-                    
-                    if (primary) {
-                        const percent = parseInt(primary.used_percent) || 0;
-                        const resetTime = new Date(Date.now() + (primary.resets_in_seconds || 0) * 1000);
-                        const resetInfo = resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'});
-                        primaryCell.innerHTML = formatUsageCell(percent, resetInfo, false);
-                    }
-                    
-                    if (secondary) {
-                        const percent = parseInt(secondary.used_percent) || 0;
-                        const resetTime = new Date(Date.now() + (secondary.resets_in_seconds || 0) * 1000);
-                        const resetInfo = `${resetTime.toLocaleDateString('zh-CN', {month: '2-digit', day: '2-digit'})} ${resetTime.toLocaleTimeString('zh-CN', {hour: '2-digit', minute: '2-digit'})}`;
-                        secondaryCell.innerHTML = formatUsageCell(percent, resetInfo, false);
-                    }
-                } else {
-                    primaryCell.innerHTML = '<span class="usage-text" style="color: var(--warning);">无数据</span>';
-                    secondaryCell.innerHTML = '<span class="usage-text" style="color: var(--warning);">无数据</span>';
-                }
-            } else {
-                primaryCell.innerHTML = '<span class="usage-text" style="color: var(--text-muted);">-</span>';
-                secondaryCell.innerHTML = '<span class="usage-text" style="color: var(--text-muted);">-</span>';
+        if (preloadedSummary?.status === 'success' && preloadedSummary.rate_limits) {
+            renderUsageRateLimits(accountName, preloadedSummary.rate_limits, !!preloadedSummary.from_cache);
+            return;
+        }
+
+        // 当前账号优先走官方接口，避免长期显示旧缓存
+        if (account.is_current && !skipLiveFetch) {
+            const currentAuth = await readSystemAuthConfig();
+            const summary = await getUsageSummary(account.email, currentAuth);
+            if (summary.status === 'success' && summary.rate_limits) {
+                renderUsageRateLimits(accountName, summary.rate_limits, false);
+                return;
             }
         }
+
+        if (allowCacheFallback) {
+            const cachedUsage = await loadCachedUsage(account.email);
+            if (cachedUsage?.rate_limits) {
+                renderUsageRateLimits(accountName, cachedUsage.rate_limits, true);
+                return;
+            }
+        }
+
+        if (account.is_current) {
+            const { primaryCell, secondaryCell } = getUsageCells(accountName);
+            renderEmptyUsageCell(primaryCell, '无数据', '--warning');
+            renderEmptyUsageCell(secondaryCell, '无数据', '--warning');
+        } else {
+            const { primaryCell, secondaryCell } = getUsageCells(accountName);
+            renderEmptyUsageCell(primaryCell);
+            renderEmptyUsageCell(secondaryCell);
+        }
     } catch (error) {
-        primaryCell.innerHTML = '<span class="usage-text" style="color: var(--danger);">错误</span>';
-        secondaryCell.innerHTML = '<span class="usage-text" style="color: var(--danger);">错误</span>';
+        const { primaryCell, secondaryCell } = getUsageCells(accountName);
+        renderEmptyUsageCell(primaryCell, '错误', '--danger');
+        renderEmptyUsageCell(secondaryCell, '错误', '--danger');
     }
 }
 
@@ -799,24 +1258,34 @@ async function refreshCurrentAccountUsage(accountName) {
         showMessage('只能刷新当前账号的用量', 'error');
         return;
     }
+
+    const { primaryCell, secondaryCell } = getUsageCells(accountName);
+    const previousPrimaryHtml = primaryCell?.innerHTML || '';
+    const previousSecondaryHtml = secondaryCell?.innerHTML || '';
     
     try {
         showMessage(`正在刷新账号 ${accountName} 的用量数据...`, 'success');
-        
-        // 从session读取最新用量
-        const summary = await getUsageSummary(account.email);
+        renderUsageLoading(accountName);
+
+        const currentAuth = await readSystemAuthConfig();
+        const summary = await getUsageSummary(account.email, currentAuth);
         
         if (summary.status === 'success') {
+            await loadAccountUsage(accountName, {
+                preloadedSummary: summary,
+                allowCacheFallback: false,
+                skipLiveFetch: true
+            });
             showMessage(`已刷新账号 ${account.email} 的用量数据`, 'success');
-            // 刷新成功后重新加载用量显示
-            setTimeout(() => {
-                loadAccountUsage(accountName);
-            }, 500);
         } else {
             const errorMsg = summary.errors?.[0] || '未知错误';
+            if (primaryCell) primaryCell.innerHTML = previousPrimaryHtml;
+            if (secondaryCell) secondaryCell.innerHTML = previousSecondaryHtml;
             showMessage(`刷新失败: ${errorMsg}`, 'error');
         }
     } catch (error) {
+        if (primaryCell) primaryCell.innerHTML = previousPrimaryHtml;
+        if (secondaryCell) secondaryCell.innerHTML = previousSecondaryHtml;
         showMessage('刷新失败: ' + error.message, 'error');
     }
 }
@@ -829,6 +1298,10 @@ function showMessage(message, type = 'success') {
     const messageArea = document.getElementById('message-area');
     const icon = type === 'success' ? '[成功]' : '[错误]';
     const alertClass = type === 'success' ? 'alert-success' : 'alert-error';
+
+    if (type === 'error') {
+        appendLogEntry('error', String(message));
+    }
     
     const toast = document.createElement('div');
     toast.className = `toast ${alertClass}`;
@@ -882,10 +1355,14 @@ async function initApp() {
         console.log('🚀 初始化 Tauri 应用...');
         await initPaths();
         await ensureDirs();
+        await loadSettings();
+        await loadAppLogs();
+        renderSettingsLogs();
         await loadAccounts();
         console.log('✅ 应用初始化完成');
     } catch (e) {
         console.error('初始化失败:', e);
+        appendLogEntry('error', '应用初始化失败', serializeErrorDetails(e));
         showMessage('应用初始化失败: ' + e.message, 'error');
     }
 }
@@ -903,3 +1380,9 @@ window.refreshData = refreshData;
 window.handleSwitchClick = handleSwitchClick;
 window.handleDeleteClick = handleDeleteClick;
 window.handleRefreshClick = handleRefreshClick;
+window.openSettingsModal = openSettingsModal;
+window.closeSettingsModal = closeSettingsModal;
+window.handleSettingsOverlayClick = handleSettingsOverlayClick;
+window.saveSettingsModal = saveSettingsModal;
+window.refreshSettingsLogs = refreshSettingsLogs;
+window.clearErrorLogs = clearErrorLogs;

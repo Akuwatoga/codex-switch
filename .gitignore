@@ -58,3 +58,8 @@ Thumbs.db
 # 备份文件
 *.backup
 *.bak
+
+# Tauri build outputs
+codex-tauri-app/dist/
+codex-tauri-app/src-tauri/target/
+*.dmg

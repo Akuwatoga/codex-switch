@@ -1,7 +1,7 @@
 {
-  "productName": "Codex Account Manager",
-  "version": "0.1.0",
-  "identifier": "com.codex.account-manager",
+  "productName": "Codex Switch",
+  "version": "1.0.0",
+  "identifier": "com.codex.switch",
   "build": {
     "beforeDevCommand": "npm run vite",
     "beforeBuildCommand": "vite build",
@@ -22,7 +22,7 @@
   "app": {
     "windows": [
       {
-        "title": "Codex Account Manager",
+        "title": "Codex Switch",
         "width": 1000,
         "height": 600,
         "resizable": true,

@@ -1,0 +1,35 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="frameBody" x1="248" y1="260" x2="776" y2="764" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4066BA"/>
+      <stop offset="0.48" stop-color="#2C488C"/>
+      <stop offset="1" stop-color="#182954"/>
+    </linearGradient>
+    <linearGradient id="frameGloss" x1="246" y1="282" x2="704" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F4FBFF" stop-opacity="0.36"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="terminalLine" x1="404" y1="422" x2="656" y2="596" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#DAE7FF"/>
+    </linearGradient>
+    <filter id="dropShadow" x="130" y="182" width="764" height="704" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="20"/>
+      <feGaussianBlur stdDeviation="30"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.027451 0 0 0 0 0.0627451 0 0 0 0 0.133333 0 0 0 0.26 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_0_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_0_1" result="shape"/>
+    </filter>
+  </defs>
+  <g filter="url(#dropShadow)">
+    <rect x="208" y="260" width="608" height="504" rx="148" fill="url(#frameBody)"/>
+    <rect x="208" y="260" width="608" height="504" rx="148" stroke="#F5FAFF" stroke-width="26"/>
+    <rect x="278" y="330" width="468" height="364" rx="88" fill="#09122A" fill-opacity="0.34"/>
+    <rect x="278" y="330" width="468" height="364" rx="88" stroke="#EBF4FF" stroke-opacity="0.15" stroke-width="4"/>
+    <rect x="236" y="286" width="552" height="184" rx="118" fill="url(#frameGloss)"/>
+    <path d="M408 426L496 512L408 598" stroke="url(#terminalLine)" stroke-width="38" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M550 575H654" stroke="url(#terminalLine)" stroke-width="34" stroke-linecap="round"/>
+  </g>
+</svg>
