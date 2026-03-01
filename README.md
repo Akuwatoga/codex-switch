@@ -8,9 +8,11 @@
 
 Codex Switch is a desktop and script-based tool for backing up, switching, and inspecting multiple Codex account configurations.
 
-## Demo Screenshot
+## Screenshots
 
-![Codex Switch demo](assets/screenshot.png)
+![Codex Switch home screen](assets/screenshot.png)
+
+![Codex Switch settings](assets/settings-screenshot.png)
 
 ## Overview
 

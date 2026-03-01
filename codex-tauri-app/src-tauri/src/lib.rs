@@ -76,17 +76,22 @@ fn apply_proxy(
 }
 
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let _ = ensure_tray_icon(app);
+
     #[cfg(target_os = "macos")]
     let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
     if let Some(window) = app.get_webview_window("main") {
+        if let Some(icon) = app.default_window_icon() {
+            let _ = window.set_icon(icon.clone());
+        }
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
 }
 
-fn setup_tray<R: tauri::Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()> {
+fn build_tray_icon<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
     let tray_menu = MenuBuilder::new(app)
         .text(MENU_SHOW, "Show Codex Switch")
         .separator()
@@ -117,6 +122,14 @@ fn setup_tray<R: tauri::Runtime>(app: &mut tauri::App<R>) -> tauri::Result<()> {
         .build(app)?;
 
     Ok(())
+}
+
+fn ensure_tray_icon<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> tauri::Result<()> {
+    if app.tray_by_id("main-tray").is_some() {
+        return Ok(());
+    }
+
+    build_tray_icon(app)
 }
 
 #[tauri::command]
@@ -156,11 +169,11 @@ async fn fetch_wham_usage(access_token: String, proxy_config: Option<ProxyConfig
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            setup_tray(app)?;
+            ensure_tray_icon(&app.handle())?;
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -168,12 +181,22 @@ pub fn run() {
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window.hide();
+                    let _ = ensure_tray_icon(&window.app_handle());
                     #[cfg(target_os = "macos")]
-                    let _ = window.app_handle().set_activation_policy(tauri::ActivationPolicy::Accessory);
+                    let _ = window
+                        .app_handle()
+                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
                 }
             }
         })
         .invoke_handler(tauri::generate_handler![fetch_wham_usage])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    app.run(|app_handle, event| {
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            show_main_window(app_handle);
+        }
+    });
 }

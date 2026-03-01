@@ -10,7 +10,9 @@
 
 ## 演示截图
 
-![Codex Switch 演示截图](assets/screenshot.png)
+![Codex Switch 主页截图](assets/screenshot.png)
+
+![Codex Switch 设置截图](assets/settings-screenshot.png)
 
 ## 项目概览
 
