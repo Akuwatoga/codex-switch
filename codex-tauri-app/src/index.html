@@ -11,6 +11,10 @@
     <div class="titlebar">
         <div class="titlebar-left">
             <span class="app-title">Codex Switch</span>
+            <select class="toolbar-select" id="provider-select" onchange="handleProviderChange(this.value)">
+                <option value="account">账号模式</option>
+                <option value="yunyi">Yunyi</option>
+            </select>
         </div>
         <div class="titlebar-right">
             <button class="toolbar-btn" id="quick-save-btn" onclick="quickSave()" title="导入当前账号">导入当前账号</button>
@@ -85,6 +89,16 @@
                     <label for="proxy-url">代理地址</label>
                     <input id="proxy-url" class="form-input" type="text" placeholder="host:port">
                     <div class="form-hint">只需填写一个代理地址。未填写协议时，应用会自动补全 `http://`。</div>
+                </div>
+
+                <div class="form-group">
+                    <label for="auth-mode-select">认证模式</label>
+                    <select id="auth-mode-select" class="form-input">
+                        <option value="auto">自动 (根据账号配置)</option>
+                        <option value="api_key">API Key 模式</option>
+                        <option value="account">账号模式 (Token)</option>
+                    </select>
+                    <div class="form-hint">全局认证模式。API Key 模式使用 OPENAI_API_KEY，账号模式使用 token。自动会根据账号配置自动判断。</div>
                 </div>
 
                 <div class="settings-meta">

@@ -14,7 +14,12 @@ let appSettings = {
     proxy: {
         proxyUrl: ''
     },
-    settingsVersion: 3
+    settingsVersion: 3,
+    // 全局认证模式: "auto" | "api_key" | "account"
+    // auto: 根据账号配置自动判断
+    // api_key: 强制使用 API Key
+    // account: 强制使用账号模式
+    authMode: 'auto'
 };
 let appLogs = [];
 let logWriteQueue = Promise.resolve();
@@ -25,7 +30,8 @@ const DEFAULT_SETTINGS = {
     proxy: {
         proxyUrl: ''
     },
-    settingsVersion: 3
+    settingsVersion: 3,
+    authMode: 'auto'
 };
 
 function cloneJson(data) {
@@ -120,6 +126,18 @@ function extractAccessToken(config) {
     return typeof accessToken === 'string' && accessToken ? accessToken : null;
 }
 
+function extractApiKey(config) {
+    const authConfig = extractStoredAuth(config);
+    const apiKey = authConfig?.OPENAI_API_KEY;
+    return typeof apiKey === 'string' && apiKey ? apiKey : null;
+}
+
+function maskApiKey(apiKey) {
+    if (typeof apiKey !== 'string' || !apiKey) return null;
+    if (apiKey.length <= 8) return '***';
+    return `${apiKey.slice(0, 4)}...${apiKey.slice(-4)}`;
+}
+
 function getActiveProxyConfig() {
     const proxy = appSettings?.proxy || {};
     return {
@@ -199,6 +217,12 @@ function sameAccount(left, right) {
         }
     }
 
+    const leftApiKey = extractApiKey(leftAuth);
+    const rightApiKey = extractApiKey(rightAuth);
+    if (leftApiKey && rightApiKey) {
+        return leftApiKey === rightApiKey;
+    }
+
     const leftEmail = extractEmailFromToken(leftAuth);
     const rightEmail = extractEmailFromToken(rightAuth);
     if (leftEmail && rightEmail) {
@@ -237,9 +261,60 @@ function validateAuthConfig(config) {
     throw new Error('账号配置缺少可用的认证字段');
 }
 
+function hasAuthTokens(config) {
+    if (!config || typeof config !== 'object') return false;
+    const tokens = config.tokens;
+    if (!tokens || typeof tokens !== 'object') return false;
+    return Boolean(tokens.refresh_token || tokens.access_token || tokens.id_token);
+}
+
+function detectAuthMode(config) {
+    if (!config || typeof config !== 'object') return null;
+    if (config.auth_mode) return String(config.auth_mode);
+
+    const apiKey = extractApiKey(config);
+    const hasTokens = hasAuthTokens(config);
+
+    if (apiKey && !hasTokens) return 'api_key';
+    if (hasTokens) return 'account';
+    if (apiKey) return 'api_key';
+    return null;
+}
+
+function prepareAuthForSwitch(config, forceMode = null) {
+    const authSnapshot = extractStoredAuth(config);
+
+    // 优先级: forceMode > config.auth_mode > 全局设置 > 自动检测
+    let explicitMode = null;
+    if (forceMode) {
+        explicitMode = forceMode;
+    } else if (config && typeof config === 'object' && config.auth_mode) {
+        explicitMode = String(config.auth_mode);
+    } else if (appSettings.authMode && appSettings.authMode !== 'auto') {
+        explicitMode = appSettings.authMode;
+    }
+
+    const authMode = explicitMode || detectAuthMode(authSnapshot);
+
+    if (authMode === 'api_key') {
+        authSnapshot.auth_mode = 'api_key';
+    } else {
+        if (hasAuthTokens(authSnapshot)) {
+            delete authSnapshot.OPENAI_API_KEY;
+        }
+        if (authSnapshot.auth_mode === 'api_key' || authMode === 'account') {
+            delete authSnapshot.auth_mode;
+        }
+    }
+
+    validateAuthConfig(authSnapshot);
+    return authSnapshot;
+}
+
 function buildStoredAccountRecord(authConfig, accountName) {
     const authSnapshot = extractStoredAuth(authConfig);
     validateAuthConfig(authSnapshot);
+    const authMode = detectAuthMode(authSnapshot);
 
     const metadata = {
         schema_version: 2,
@@ -248,7 +323,7 @@ function buildStoredAccountRecord(authConfig, accountName) {
         email: extractEmailFromToken(authSnapshot),
         account_id: extractAccountId(authSnapshot),
         plan: extractPlanType(authSnapshot),
-        auth_mode: authSnapshot.auth_mode || null,
+        auth_mode: authMode,
         auth_snapshot: cloneJson(authSnapshot)
     };
 
@@ -338,6 +413,13 @@ function normalizeSettings(rawSettings) {
         ''
     );
 
+    // 验证 authMode
+    const authMode = rawSettings?.authMode;
+    let normalizedAuthMode = DEFAULT_SETTINGS.authMode;
+    if (authMode === 'api_key' || authMode === 'account' || authMode === 'auto') {
+        normalizedAuthMode = authMode;
+    }
+
     return {
         maxLogEntries: Number.isFinite(maxLogEntries)
             ? Math.max(50, Math.min(5000, Math.round(maxLogEntries)))
@@ -345,7 +427,8 @@ function normalizeSettings(rawSettings) {
         proxy: {
             proxyUrl
         },
-        settingsVersion: DEFAULT_SETTINGS.settingsVersion
+        settingsVersion: DEFAULT_SETTINGS.settingsVersion,
+        authMode: normalizedAuthMode
     };
 }
 
@@ -442,6 +525,7 @@ function renderSettingsLogs() {
     const logFilePath = document.getElementById('log-file-path');
     const maxLogEntries = document.getElementById('max-log-entries');
     const proxyUrl = document.getElementById('proxy-url');
+    const authModeSelect = document.getElementById('auth-mode-select');
 
     if (logEntryCount) {
         logEntryCount.textContent = String(appLogs.length);
@@ -464,6 +548,10 @@ function renderSettingsLogs() {
 
     if (proxyUrl) {
         proxyUrl.value = appSettings.proxy?.proxyUrl || '';
+    }
+
+    if (authModeSelect) {
+        authModeSelect.value = appSettings.authMode || 'auto';
     }
 
     if (logContent) {
@@ -495,12 +583,14 @@ function handleSettingsOverlayClick(event) {
 async function saveSettingsModal() {
     const input = document.getElementById('max-log-entries');
     const proxyUrl = document.getElementById('proxy-url');
+    const authModeSelect = document.getElementById('auth-mode-select');
     const nextValue = Number(input?.value);
     appSettings = normalizeSettings({
         maxLogEntries: nextValue,
         proxy: {
             proxyUrl: proxyUrl?.value || ''
-        }
+        },
+        authMode: authModeSelect?.value || 'auto'
     });
     appLogs = trimLogs(appLogs);
     await saveSettings();
@@ -801,16 +891,21 @@ async function quickSave() {
         }
         
         const email = extractEmailFromToken(config);
-        if (!email) {
-            throw new Error('无法从配置中提取邮箱信息');
+        const accountId = extractAccountId(config);
+        const apiKey = extractApiKey(config);
+        const accountSeed = email || accountId || (apiKey ? `api_key_${apiKey.slice(-6)}` : null);
+        if (!accountSeed) {
+            throw new Error('当前配置缺少可识别的账号标识');
         }
         
-        const accountName = generateAccountName(email);
+        const accountName = generateAccountName(accountSeed);
         const accountRecord = buildStoredAccountRecord(config, accountName);
         const accountFile = await join(PATHS.accountsDir, `${accountName}.json`);
         await writeJsonSafe(accountFile, accountRecord);
+
+        const identity = email || (accountId ? `账号ID ${accountId}` : `API Key ${maskApiKey(apiKey)}`);
         
-        showMessage(`成功保存账号: ${accountName} (${email})`, 'success');
+        showMessage(`成功保存账号: ${accountName} (${identity})`, 'success');
         await loadAccounts();
     } catch (e) {
         showMessage('保存账号失败: ' + e.message, 'error');
@@ -823,49 +918,138 @@ async function quickSave() {
 async function quickSwitchAccount(accountName) {
     console.log('🔄 准备切换到账号:', accountName);
     console.log('当前accounts数组:', accounts);
-    
-    const confirmed = await confirm(`确定要切换到账号 '${accountName}' 吗？`, {
-        title: '确认切换',
-        type: 'warning',
-        okLabel: '确定',
-        cancelLabel: '取消'
-    });
-    
+
+    const account = accounts.find(a => a.name === accountName);
+    if (!account) {
+        showMessage('账号不存在', 'error');
+        return;
+    }
+
+    if (!account.config) {
+        console.error('账号config为空:', account);
+        showMessage('账号配置为空', 'error');
+        return;
+    }
+
+    // 获取当前的连接模式（从下拉框）
+    const providerSelect = document.getElementById('provider-select');
+    const currentProvider = providerSelect ? providerSelect.value : 'account';
+    console.log('当前连接模式:', currentProvider);
+
+    // 如果是 yunyi 模式，先切换到账号模式
+    if (currentProvider === 'yunyi') {
+        try {
+            console.log('当前是 yunyi 模式，切换到账号模式...');
+            await invoke('switch_codex_provider', { provider: 'account' });
+            updateProviderSelect('account');
+            showMessage('已切换到账号模式，正在切换账号...', 'success');
+        } catch (e) {
+            console.error('切换 provider 失败:', e);
+            showMessage('切换模式失败: ' + e, 'error');
+            return;
+        }
+    }
+
+    // 检测账号支持的认证模式
+    const authSnapshot = extractStoredAuth(account.config);
+    const hasApiKey = extractApiKey(authSnapshot);
+    const hasTokens = hasAuthTokens(authSnapshot);
+
+    let forceMode = null;
+    let modeDescription = '';
+
+    // 如果全局设置不是 auto，检查账号是否支持该模式
+    if (appSettings.authMode !== 'auto') {
+        const globalMode = appSettings.authMode;
+        if (globalMode === 'api_key' && !hasApiKey) {
+            // 全局设置为 API Key，但账号没有 API Key
+            console.log('全局设置为 API Key 模式，但账号没有 API Key');
+            if (hasTokens) {
+                console.log('自动切换到账号模式');
+                forceMode = 'account';
+                modeDescription = '账号模式 (自动切换)';
+            } else {
+                showMessage('账号缺少有效的认证信息', 'error');
+                return;
+            }
+        } else if (globalMode === 'account' && !hasTokens) {
+            // 全局设置为账号模式，但账号没有 token
+            console.log('全局设置为账号模式，但账号没有 token');
+            if (hasApiKey) {
+                console.log('自动切换到 API Key 模式');
+                forceMode = 'api_key';
+                modeDescription = 'API Key 模式 (自动切换)';
+            } else {
+                showMessage('账号缺少有效的认证信息', 'error');
+                return;
+            }
+        } else {
+            forceMode = globalMode;
+            modeDescription = forceMode === 'api_key' ? 'API Key 模式' : '账号模式';
+        }
+    } else if (hasApiKey && hasTokens) {
+        // 账号同时支持 API Key 和 Token，让用户选择
+        const selected = await ask(
+            `账号 '${accountName}' 同时支持 API Key 和账号模式。\n\n请选择切换模式：\n• 使用 API Key (api_key)\n• 使用账号 Token (account)\n\n当前全局设置为: 自动 (auto)`,
+            {
+                title: '选择认证模式',
+                okLabel: 'API Key',
+                cancelLabel: '账号 Token'
+            }
+        );
+
+        if (selected) {
+            forceMode = 'api_key';
+            modeDescription = 'API Key 模式';
+        } else {
+            forceMode = 'account';
+            modeDescription = '账号模式';
+        }
+    } else if (hasApiKey) {
+        forceMode = 'api_key';
+        modeDescription = 'API Key 模式';
+    } else if (hasTokens) {
+        forceMode = 'account';
+        modeDescription = '账号模式';
+    } else {
+        showMessage('账号配置缺少有效的认证信息', 'error');
+        return;
+    }
+
+    const confirmed = await confirm(
+        `确定要切换到账号 '${accountName}' 吗？\n\n模式: ${modeDescription}`,
+        {
+            title: '确认切换',
+            type: 'warning',
+            okLabel: '确定',
+            cancelLabel: '取消'
+        }
+    );
+
     if (!confirmed) {
         console.log('用户取消切换');
         return;
     }
-    
+
     try {
         showMessage(`正在切换到账号 ${accountName}...`, 'success');
-        
-        const account = accounts.find(a => a.name === accountName);
-        console.log('找到账号对象:', account);
-        
-        if (!account) {
-            throw new Error('账号不存在');
-        }
-        
-        if (!account.config) {
-            console.error('账号config为空:', account);
-            throw new Error('账号配置为空');
-        }
-        
+
         console.log('账号配置:', account.config);
-        
-        const cleanConfig = extractStoredAuth(account.config);
-        validateAuthConfig(cleanConfig);
+        console.log('使用模式:', forceMode);
+
+        const cleanConfig = prepareAuthForSwitch(account.config, forceMode);
 
         const currentSystemConfig = await readJsonSafe(PATHS.systemAuthFile);
         if (currentSystemConfig) {
             await writeJsonSafe(`${PATHS.systemAuthFile}.backup`, currentSystemConfig);
         }
-        
+
         console.log('准备写入系统配置:', PATHS.systemAuthFile);
         await writeJsonSafe(PATHS.systemAuthFile, cleanConfig);
         console.log('✅ 系统配置写入成功');
-        
-        showMessage(`已切换到账号 ${accountName}，现在可以直接刷新官方用量`, 'success');
+
+        const modeText = forceMode === 'api_key' ? 'API Key' : (forceMode === 'account' ? '账号 Token' : '自动');
+        showMessage(`已切换到账号 ${accountName} (${modeText}模式)，请完全退出 Codex 并重新打开`, 'success');
         selectedAccount = null;
         await loadAccounts();
     } catch (e) {
@@ -1347,6 +1531,58 @@ function refreshData() {
 }
 
 // =============================================================================
+// Provider 切换 (yunyi / 账号模式)
+// =============================================================================
+
+async function loadProviderStatus() {
+    try {
+        const provider = await invoke('get_codex_provider');
+        updateProviderSelect(provider);
+    } catch (e) {
+        console.error('获取 provider 状态失败:', e);
+    }
+}
+
+function updateProviderSelect(provider) {
+    const select = document.getElementById('provider-select');
+    if (select) {
+        select.value = provider === 'yunyi' ? 'yunyi' : 'account';
+    }
+}
+
+async function handleProviderChange(newProvider) {
+    try {
+        const confirmed = await confirm(
+            `确定要切换到 ${newProvider === 'yunyi' ? 'Yunyi' : '账号'} 模式吗？\n\n切换后需要完全退出 Codex 并重新打开才能生效。`,
+            {
+                title: '切换连接模式',
+                type: 'warning',
+                okLabel: '确定',
+                cancelLabel: '取消'
+            }
+        );
+
+        if (!confirmed) {
+            // 恢复原来的选择
+            const currentProvider = await invoke('get_codex_provider');
+            updateProviderSelect(currentProvider);
+            return;
+        }
+
+        showMessage(`正在切换到 ${newProvider === 'yunyi' ? 'Yunyi' : '账号'} 模式...`, 'success');
+
+        const result = await invoke('switch_codex_provider', { provider: newProvider });
+        showMessage(result + '，请完全退出 Codex 并重新打开', 'success');
+    } catch (e) {
+        console.error('切换 provider 失败:', e);
+        // 恢复原来的选择
+        const currentProvider = await invoke('get_codex_provider');
+        updateProviderSelect(currentProvider);
+        showMessage('切换失败: ' + e, 'error');
+    }
+}
+
+// =============================================================================
 // 初始化应用
 // =============================================================================
 
@@ -1359,6 +1595,7 @@ async function initApp() {
         await loadAppLogs();
         renderSettingsLogs();
         await loadAccounts();
+        await loadProviderStatus();
         console.log('✅ 应用初始化完成');
     } catch (e) {
         console.error('初始化失败:', e);

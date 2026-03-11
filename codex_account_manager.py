@@ -10,9 +10,9 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from codex_auth import build_account_record, extract_account_id_from_auth, extract_email_from_auth, extract_stored_auth, validate_auth_config
+from codex_auth import build_account_record, extract_account_id_from_auth, extract_email_from_auth, prepare_auth_for_switch
 from usage_checker import CodexUsageChecker
-from config_utils import get_config_paths, generate_account_name
+from config_utils import get_config_paths, generate_account_name, load_settings, save_settings, get_auth_mode, set_auth_mode
 
 
 class CodexAccountManager:
@@ -129,20 +129,29 @@ class CodexAccountManager:
         
         return accounts
     
-    def switch_account(self, account_name):
+    def switch_account(self, account_name, force_mode=None):
         """切换到指定账号"""
         account_file = self.accounts_dir / f"{account_name}.json"
-        
+
         if not account_file.exists():
             print(f"❌ 账号配置不存在: {account_name}")
             return False
-        
+
         try:
             # 读取目标账号配置
             target_config = self._load_config(account_file)
-            clean_config = extract_stored_auth(target_config)
-            validate_auth_config(clean_config)
-            
+
+            # 确定使用的模式：force_mode > 全局设置 > 自动
+            effective_mode = force_mode
+            if not effective_mode:
+                global_mode = get_auth_mode()
+                if global_mode != 'auto':
+                    effective_mode = global_mode
+                    mode_desc = "API Key" if effective_mode == 'api_key' else "账号模式"
+                    print(f"🌐 使用全局设置: {mode_desc}")
+
+            clean_config = prepare_auth_for_switch(target_config, force_mode=effective_mode)
+
             if self.system_auth_file.exists():
                 backup_file = self.system_auth_file.with_suffix('.json.backup')
                 shutil.copy2(self.system_auth_file, backup_file)
@@ -150,14 +159,20 @@ class CodexAccountManager:
             # 直接写入系统 Codex 配置
             self.system_auth_file.parent.mkdir(parents=True, exist_ok=True)
             if self._save_config(self.system_auth_file, clean_config):
-                print(f"✅ 成功切换到账号: {account_name}")
-                
+                # 显示使用的模式
+                if effective_mode == 'api_key':
+                    print(f"✅ 成功切换到账号: {account_name} (API Key 模式)")
+                elif effective_mode == 'account':
+                    print(f"✅ 成功切换到账号: {account_name} (账号模式)")
+                else:
+                    print(f"✅ 成功切换到账号: {account_name}")
+
                 # 显示账号信息
                 account_id = target_config.get('account_id') or extract_account_id_from_auth(target_config) or '未知'
                 print(f"🔹 账号ID: {account_id}")
                 print(f"📂 系统配置: {self.system_auth_file}")
                 return True
-            
+
         except Exception as e:
             print(f"❌ 切换失败: {e}")
             return False
@@ -272,13 +287,18 @@ class CodexAccountManager:
 def main():
     print("🚀 Codex Switch")
     print(f"📁 配置存储: {Path(__file__).parent / 'codex-config'}")
-    
+
     manager = CodexAccountManager()
-    
+
     while True:
+        current_mode = get_auth_mode()
+        mode_desc = {'auto': '自动', 'api_key': 'API Key', 'account': '账号模式'}
+
         print("\n" + "=" * 50)
         print("🚀 Codex Switch")
         print("=" * 50)
+        print(f"当前认证模式: {mode_desc.get(current_mode, current_mode)}")
+        print("-" * 50)
         print("1. 保存当前账号配置")
         print("2. 从配置内容添加账号")
         print("3. 列出所有账号")
@@ -288,15 +308,16 @@ def main():
         print("7. 查看当前账号用量（缓存）")
         print("8. 查看指定账号用量（缓存）")
         print("9. 刷新当前账号用量（官方接口）")
+        print("A. 设置认证模式")
         print("0. 退出")
         print("-" * 50)
-        
+
         try:
-            choice = input("请选择操作 (0-9): ").strip()
+            choice = input("请选择操作 (0-9, A): ").strip().lower()
         except KeyboardInterrupt:
             print("\n👋 再见！")
             break
-        
+
         if choice == "1":
             try:
                 account_name = input("请输入账号名称: ").strip()
@@ -307,17 +328,17 @@ def main():
             except KeyboardInterrupt:
                 print("\n⚠️ 操作取消")
                 continue
-        
+
         elif choice == "2":
             try:
                 account_name = input("请输入账号名称: ").strip()
                 if not account_name:
                     print("❌ 账号名称不能为空")
                     continue
-                
+
                 print("请粘贴完整的 auth.json 配置内容 (以 {} 开始和结束):")
                 print("输入完成后按 Ctrl+D (Linux/Mac) 或 Ctrl+Z (Windows) 结束:")
-                
+
                 config_lines = []
                 try:
                     while True:
@@ -328,7 +349,7 @@ def main():
                 except KeyboardInterrupt:
                     print("\n⚠️ 操作取消")
                     continue
-                
+
                 config_text = '\n'.join(config_lines).strip()
                 if config_text:
                     manager.save_account_from_config(account_name, config_text)
@@ -337,23 +358,38 @@ def main():
             except KeyboardInterrupt:
                 print("\n⚠️ 操作取消")
                 continue
-        
+
         elif choice == "3":
             manager.list_accounts()
-        
+
         elif choice == "4":
             accounts = manager.list_accounts()
             if accounts:
                 try:
-                    account_name = input("请输入要切换的账号名称: ").strip()
-                    if account_name in accounts:
-                        manager.switch_account(account_name)
+                    print("\n切换模式选项:")
+                    print("  1. 使用全局设置 (当前: {})".format(mode_desc.get(current_mode, current_mode)))
+                    print("  2. 强制使用 API Key")
+                    print("  3. 强制使用账号模式")
+                    mode_choice = input("请选择 (1-3): ").strip()
+
+                    force_mode = None
+                    if mode_choice == "2":
+                        force_mode = "api_key"
+                    elif mode_choice == "3":
+                        force_mode = "account"
+
+                    if mode_choice in ("1", "2", "3"):
+                        account_name = input("请输入要切换的账号名称: ").strip()
+                        if account_name in accounts:
+                            manager.switch_account(account_name, force_mode=force_mode)
+                        else:
+                            print("❌ 账号名称不存在")
                     else:
-                        print("❌ 账号名称不存在")
+                        print("❌ 无效选择")
                 except KeyboardInterrupt:
                     print("\n⚠️ 操作取消")
                     continue
-        
+
         elif choice == "5":
             accounts = manager.list_accounts()
             if accounts:
@@ -372,13 +408,13 @@ def main():
                 except KeyboardInterrupt:
                     print("\n⚠️ 操作取消")
                     continue
-        
+
         elif choice == "6":
             manager.show_current_account()
-        
+
         elif choice == "7":
             manager.check_account_usage()
-        
+
         elif choice == "8":
             accounts = manager.list_accounts()
             if accounts:
@@ -391,14 +427,43 @@ def main():
                 except KeyboardInterrupt:
                     print("\n⚠️ 操作取消")
                     continue
-        
+
         elif choice == "9":
             manager.check_account_usage(force_refresh=True)
-        
+
+        elif choice == "a":
+            print("\n设置认证模式:")
+            print("  1. 自动 (根据账号配置自动判断)")
+            print("  2. API Key 模式 (强制使用 OPENAI_API_KEY)")
+            print("  3. 账号模式 (强制使用 token)")
+            print("  4. 查看当前设置")
+
+            mode_choice = input("请选择 (1-4): ").strip()
+            if mode_choice == "1":
+                if set_auth_mode("auto"):
+                    print("✅ 已设置为: 自动")
+                else:
+                    print("❌ 设置失败")
+            elif mode_choice == "2":
+                if set_auth_mode("api_key"):
+                    print("✅ 已设置为: API Key 模式")
+                else:
+                    print("❌ 设置失败")
+            elif mode_choice == "3":
+                if set_auth_mode("account"):
+                    print("✅ 已设置为: 账号模式")
+                else:
+                    print("❌ 设置失败")
+            elif mode_choice == "4":
+                current = get_auth_mode()
+                print(f"当前认证模式: {mode_desc.get(current, current)}")
+            else:
+                print("❌ 无效选择")
+
         elif choice == "0":
             print("👋 再见!")
             break
-        
+
         else:
             print("❌ 无效选择，请重试")
 

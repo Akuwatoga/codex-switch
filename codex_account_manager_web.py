@@ -6,17 +6,19 @@ OpenAI Codex 账号配置管理器 - Web版本
 """
 
 import json
+import shutil
 import webbrowser
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 from codex_auth import (
     build_account_record,
+    extract_account_id_from_auth,
+    extract_api_key_from_auth,
     extract_email_from_auth,
     extract_plan_from_auth,
-    extract_stored_auth,
+    prepare_auth_for_switch,
     same_account,
-    validate_auth_config,
 )
 from usage_checker import OpenAIUsageChecker
 from config_utils import generate_account_name, get_config_paths
@@ -100,22 +102,33 @@ class CodexAccountManagerWeb:
                 current_config = json.load(f)
             
             email = self.extract_email_from_token(current_config)
+            account_id = extract_account_id_from_auth(current_config)
+            api_key = extract_api_key_from_auth(current_config)
+            account_seed = email or account_id or (f"api_key_{api_key[-6:]}" if api_key else None)
+            if not account_seed:
+                return {"error": "当前配置缺少可识别的账号标识"}
+
+            account_name = generate_account_name(account_seed)
+            account_record = build_account_record(current_config, account_name, saved_at=datetime.now().isoformat())
+            account_file = self.accounts_dir / f"{account_name}.json"
+            with open(account_file, 'w', encoding='utf-8') as f:
+                json.dump(account_record, f, indent=2, ensure_ascii=False)
+
             if email:
-                account_name = generate_account_name(email)
-                account_record = build_account_record(current_config, account_name, saved_at=datetime.now().isoformat())
-                account_file = self.accounts_dir / f"{account_name}.json"
-                with open(account_file, 'w', encoding='utf-8') as f:
-                    json.dump(account_record, f, indent=2, ensure_ascii=False)
-                
-                return {"success": f"成功保存账号: {account_name} ({email})"}
+                identity = email
+            elif account_id:
+                identity = f"账号ID {account_id}"
             else:
-                return {"error": "未能从配置中提取邮箱信息"}
+                masked_key = f"{api_key[:4]}...{api_key[-4:]}" if api_key and len(api_key) > 8 else "***"
+                identity = f"API Key {masked_key}"
+
+            return {"success": f"成功保存账号: {account_name} ({identity})"}
                 
         except Exception as e:
             return {"error": f"保存失败: {e}"}
 
 
-    def switch_account(self, account_name):
+    def switch_account(self, account_name, force_mode=None):
         """切换到指定账号"""
         try:
             account_file = self.accounts_dir / f"{account_name}.json"
@@ -127,8 +140,7 @@ class CodexAccountManagerWeb:
             with open(account_file, 'r', encoding='utf-8') as f:
                 target_config = json.load(f)
             
-            clean_config = extract_stored_auth(target_config)
-            validate_auth_config(clean_config)
+            clean_config = prepare_auth_for_switch(target_config, force_mode=force_mode)
             
             if self.system_auth_file.exists():
                 backup_file = self.system_auth_file.with_suffix('.json.backup')
@@ -315,7 +327,8 @@ class WebHandler(BaseHTTPRequestHandler):
         elif self.path == '/api/switch':
             data = parse_qs(post_data)
             account_name = data.get('account_name', [''])[0]
-            result = self.manager.switch_account(account_name)
+            mode = data.get('mode', [''])[0] or None
+            result = self.manager.switch_account(account_name, force_mode=mode)
             self.send_json_response(result)
         elif self.path == '/api/delete':
             data = parse_qs(post_data)
@@ -1020,6 +1033,9 @@ class WebHandler(BaseHTTPRequestHandler):
                             <button class="btn btn-sm btn-warning" onclick="event.stopPropagation(); quickSwitchAccount('${account.name}')">
                                 🔄 切换
                             </button>
+                            <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation(); quickSwitchAccount('${account.name}', 'api_key')">
+                                API 模式
+                            </button>
                             ${account.is_current ? `
                                 <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); refreshCurrentAccountUsage('${account.name}')">
                                     ⚡ 刷新用量
@@ -1087,18 +1103,19 @@ class WebHandler(BaseHTTPRequestHandler):
             }
         }
 
-        async function quickSwitchAccount(accountName) {
-            if (!confirm(`确定要切换到账号 '${accountName}' 吗？`)) {
+        async function quickSwitchAccount(accountName, mode = '') {
+            const modeLabel = mode === 'api_key' ? '（API 模式）' : '';
+            if (!confirm(`确定要切换到账号 '${accountName}' 吗？${modeLabel}`)) {
                 return;
             }
             
             try {
-                showMessage(`正在切换到账号 ${accountName}...`, 'success');
+                showMessage(`正在切换到账号 ${accountName}${modeLabel}...`, 'success');
                 
                 const response = await fetch('/api/switch', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: `account_name=${encodeURIComponent(accountName)}`
+                    body: `account_name=${encodeURIComponent(accountName)}&mode=${encodeURIComponent(mode || '')}`
                 });
                 const result = await response.json();
                 

@@ -167,6 +167,89 @@ async fn fetch_wham_usage(access_token: String, proxy_config: Option<ProxyConfig
         .map_err(|err| format!("解析官方用量接口响应失败: {}", err))
 }
 
+#[tauri::command]
+async fn switch_codex_provider(provider: String) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+    let config_path = home.join(".codex").join("config.toml");
+
+    if !config_path.exists() {
+        return Err("Codex 配置文件不存在".to_string());
+    }
+
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|err| format!("读取配置文件失败: {}", err))?;
+
+    let mut config: toml::Value = content.parse()
+        .map_err(|err| format!("解析配置文件失败: {}", err))?;
+
+    if provider == "yunyi" {
+        // 切换到 yunyi 模式
+        config["model_provider"] = toml::Value::String("yunyi".to_string());
+        config["model"] = toml::Value::String("gpt-5.4".to_string());
+        config["preferred_auth_method"] = toml::Value::String("apikey".to_string());
+
+        // 添加或更新 yunyi 配置
+        let mut yunyi_table = toml::map::Map::new();
+        yunyi_table.insert("name".to_string(), toml::Value::String("yunyi".to_string()));
+        yunyi_table.insert("base_url".to_string(), toml::Value::String("https://yunyi.rdzhvip.com/codex".to_string()));
+        yunyi_table.insert("wire_api".to_string(), toml::Value::String("responses".to_string()));
+        yunyi_table.insert("experimental_bearer_token".to_string(), toml::Value::String("963UQJE1-FZJP-XKQ5-P3CV-QHYCREJJB9K4".to_string()));
+        yunyi_table.insert("requires_openai_auth".to_string(), toml::Value::Boolean(true));
+
+        let mut providers = toml::map::Map::new();
+        providers.insert("yunyi".to_string(), toml::Value::Table(yunyi_table));
+        config["model_providers"] = toml::Value::Table(providers);
+    } else if provider == "account" {
+        // 切换到账号模式
+        config["model_provider"] = toml::Value::String("openai".to_string());
+        config["model"] = toml::Value::String("o3".to_string());
+        config["preferred_auth_method"] = toml::Value::String("bearer".to_string());
+
+        // 移除 yunyi 配置（如果存在）
+        if let Some(providers) = config.get_mut("model_providers") {
+            if let Some(providers_table) = providers.as_table_mut() {
+                providers_table.remove("yunyi");
+            }
+        }
+    } else {
+        return Err("无效的 provider 参数".to_string());
+    }
+
+    let new_content = toml::to_string_pretty(&config)
+        .map_err(|err| format!("序列化配置失败: {}", err))?;
+
+    std::fs::write(&config_path, new_content)
+        .map_err(|err| format!("写入配置文件失败: {}", err))?;
+
+    if provider == "yunyi" {
+        Ok("已切换到 yunyi 模式".to_string())
+    } else {
+        Ok("已切换到 Codex 账号模式".to_string())
+    }
+}
+
+#[tauri::command]
+async fn get_codex_provider() -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+    let config_path = home.join(".codex").join("config.toml");
+
+    if !config_path.exists() {
+        return Ok("unknown".to_string());
+    }
+
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|err| format!("读取配置文件失败: {}", err))?;
+
+    let config: toml::Value = content.parse()
+        .map_err(|err| format!("解析配置文件失败: {}", err))?;
+
+    let provider = config.get("model_provider")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    Ok(provider.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
