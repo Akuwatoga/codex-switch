@@ -11,9 +11,12 @@
     <div class="titlebar">
         <div class="titlebar-left">
             <span class="app-title">Codex Switch</span>
+            <span class="provider-status" id="provider-status">
+                <span class="status-dot" id="status-dot"></span>
+                <span id="status-text">检测中...</span>
+            </span>
             <select class="toolbar-select" id="provider-select" onchange="handleProviderChange(this.value)">
-                <option value="account">账号模式</option>
-                <option value="yunyi">Yunyi</option>
+                <option value="official">官方账号</option>
             </select>
         </div>
         <div class="titlebar-right">
@@ -99,6 +102,81 @@
                         <option value="account">账号模式 (Token)</option>
                     </select>
                     <div class="form-hint">全局认证模式。API Key 模式使用 OPENAI_API_KEY，账号模式使用 token。自动会根据账号配置自动判断。</div>
+                </div>
+
+                <div class="service-editor">
+                    <div class="service-editor-header">
+                        <div>
+                            <label for="service-profile-select">API 服务配置</label>
+                            <div class="form-hint">这里维护第三方 Codex API 服务。顶部下拉只负责切换，具体参数在这里编辑。</div>
+                        </div>
+                        <div class="settings-actions">
+                            <button class="btn-secondary" onclick="createServiceProfile()">新建服务</button>
+                            <button class="btn-danger" onclick="deleteCurrentServiceProfile()">删除当前服务</button>
+                        </div>
+                    </div>
+
+                    <div class="service-profile-grid">
+                        <div class="form-group">
+                            <label for="service-profile-select">当前服务</label>
+                            <select id="service-profile-select" class="form-input" onchange="handleServiceProfileSelectionChange(this.value)"></select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-id">Provider ID</label>
+                            <input id="service-profile-id" class="form-input" type="text" placeholder="yunyi">
+                            <div class="form-hint">写入 `config.toml` 的 `model_provider` 和 `model_providers.<id>` 键。</div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-name">显示名称</label>
+                            <input id="service-profile-name" class="form-input" type="text" placeholder="Yunyi">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-base-url">Base URL</label>
+                            <input id="service-profile-base-url" class="form-input" type="text" placeholder="https://example.com/codex">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-wire-api">Wire API</label>
+                            <input id="service-profile-wire-api" class="form-input" type="text" placeholder="responses">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-token">Experimental Bearer Token</label>
+                            <input id="service-profile-token" class="form-input" type="text" placeholder="可选">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-model">模型</label>
+                            <input id="service-profile-model" class="form-input" type="text" placeholder="gpt-5.3-codex">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-reasoning">Reasoning Effort</label>
+                            <input id="service-profile-reasoning" class="form-input" type="text" placeholder="high">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="service-profile-auth-method">认证方式</label>
+                            <select id="service-profile-auth-method" class="form-input">
+                                <option value="apikey">apikey</option>
+                                <option value="bearer">bearer</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="service-profile-flags">
+                        <label class="checkbox-field">
+                            <input id="service-profile-requires-openai-auth" type="checkbox">
+                            <span>需要官方账号认证</span>
+                        </label>
+                        <label class="checkbox-field">
+                            <input id="service-profile-disable-storage" type="checkbox">
+                            <span>禁用响应存储</span>
+                        </label>
+                    </div>
                 </div>
 
                 <div class="settings-meta">

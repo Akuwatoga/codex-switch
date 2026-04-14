@@ -29,6 +29,20 @@ MANAGER_METADATA_FIELDS = {
 TOKEN_KEYS = ("refresh_token", "access_token", "id_token")
 
 
+def _parse_iso_timestamp(value: Any) -> float:
+    if not isinstance(value, str) or not value.strip():
+        return 0.0
+
+    normalized = value.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+
+    try:
+        return datetime.fromisoformat(normalized).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def _has_auth_tokens(auth_data: Optional[Dict[str, Any]]) -> bool:
     if not isinstance(auth_data, dict):
         return False
@@ -43,12 +57,13 @@ def detect_auth_mode(auth_data: Optional[Dict[str, Any]]) -> Optional[str]:
     if not isinstance(auth_data, dict):
         return None
 
-    auth_mode = auth_data.get("auth_mode")
-    if auth_mode:
-        return str(auth_mode)
-
     api_key = extract_api_key_from_auth(auth_data)
     has_tokens = _has_auth_tokens(auth_data)
+    auth_mode = auth_data.get("auth_mode")
+    auth_mode_value = str(auth_mode) if auth_mode else None
+
+    if auth_mode_value == "api_key":
+        return "api_key"
 
     if api_key and not has_tokens:
         return "api_key"
@@ -56,6 +71,8 @@ def detect_auth_mode(auth_data: Optional[Dict[str, Any]]) -> Optional[str]:
         return "account"
     if api_key:
         return "api_key"
+    if auth_mode_value:
+        return auth_mode_value
     return None
 
 
@@ -245,6 +262,39 @@ def extract_plan_from_auth(auth_data: Optional[Dict[str, Any]]) -> Optional[str]
     return None
 
 
+def auth_freshness_key(auth_data: Optional[Dict[str, Any]]) -> tuple[float, int]:
+    if not isinstance(auth_data, dict):
+        return (0.0, 0)
+
+    last_refresh = _parse_iso_timestamp(auth_data.get("last_refresh"))
+    access_payload = parse_jwt_payload((auth_data.get("tokens") or {}).get("access_token"))
+    access_exp = access_payload.get("exp") if isinstance(access_payload, dict) else 0
+    if not isinstance(access_exp, int):
+        access_exp = 0
+
+    return (last_refresh, access_exp)
+
+
+def select_best_auth_snapshot(
+    auth_record: Optional[Dict[str, Any]],
+    freshness_candidates: Optional[list[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    best_auth = extract_stored_auth(auth_record)
+    best_key = auth_freshness_key(best_auth)
+
+    for candidate in freshness_candidates or []:
+        candidate_auth = extract_stored_auth(candidate)
+        if not candidate_auth or not same_account(best_auth, candidate_auth):
+            continue
+
+        candidate_key = auth_freshness_key(candidate_auth)
+        if candidate_key > best_key:
+            best_auth = candidate_auth
+            best_key = candidate_key
+
+    return copy.deepcopy(best_auth)
+
+
 def build_account_record(auth_data: Dict[str, Any], account_name: str, saved_at: Optional[str] = None) -> Dict[str, Any]:
     """Build a stored account record with metadata and a lossless auth snapshot."""
     auth_snapshot = extract_stored_auth(auth_data)
@@ -280,20 +330,17 @@ def build_account_record(auth_data: Dict[str, Any], account_name: str, saved_at:
 def prepare_auth_for_switch(
     auth_record: Optional[Dict[str, Any]],
     force_mode: Optional[str] = None,
+    freshness_candidates: Optional[list[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Return a clean auth config for ~/.codex/auth.json based on intended mode."""
-    auth_snapshot = extract_stored_auth(auth_record)
-    auth_mode = None
-    if isinstance(auth_record, dict):
-        auth_mode = auth_record.get("auth_mode")
+    auth_snapshot = select_best_auth_snapshot(auth_record, freshness_candidates=freshness_candidates)
 
     if force_mode:
         force_mode = str(force_mode)
         if force_mode not in ("api_key", "account"):
             raise ValueError("未知的切换模式")
-        auth_mode = force_mode
 
-    auth_mode = auth_mode or detect_auth_mode(auth_snapshot)
+    auth_mode = force_mode or detect_auth_mode(auth_snapshot)
 
     if auth_mode == "api_key":
         if not extract_api_key_from_auth(auth_snapshot):
@@ -302,9 +349,7 @@ def prepare_auth_for_switch(
     else:
         if not _has_auth_tokens(auth_snapshot):
             raise ValueError("账号模式需要可用的 token")
-        # Prefer account tokens; strip API key so Codex doesn't force api_key mode.
-        auth_snapshot.pop("OPENAI_API_KEY", None)
-        if auth_snapshot.get("auth_mode") == "api_key" or auth_mode == "account":
+        if auth_snapshot.get("auth_mode") == "api_key":
             auth_snapshot.pop("auth_mode", None)
 
     validate_auth_config(auth_snapshot)

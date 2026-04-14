@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::error::Error as StdError;
 use std::time::Duration;
@@ -16,12 +16,28 @@ use tauri::{
 const WHAM_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const MENU_SHOW: &str = "tray_show";
 const MENU_QUIT: &str = "tray_quit";
+const OFFICIAL_MODEL_FALLBACK: &str = "gpt-5.4";
 const TRAY_ICON: tauri::image::Image<'_> = tauri::include_image!("icons/tray-icon.png");
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProxyConfig {
     proxy_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ServiceProfilePayload {
+    id: String,
+    name: String,
+    base_url: String,
+    wire_api: String,
+    bearer_token: String,
+    requires_openai_auth: bool,
+    model: String,
+    reasoning_effort: String,
+    auth_method: String,
+    disable_response_storage: bool,
 }
 
 fn format_error_chain(err: &(dyn StdError + 'static)) -> String {
@@ -167,86 +183,153 @@ async fn fetch_wham_usage(access_token: String, proxy_config: Option<ProxyConfig
         .map_err(|err| format!("解析官方用量接口响应失败: {}", err))
 }
 
-#[tauri::command]
-async fn switch_codex_provider(provider: String) -> Result<String, String> {
+fn load_codex_config() -> Result<(std::path::PathBuf, toml::Value), String> {
     let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
     let config_path = home.join(".codex").join("config.toml");
 
+    println!("[load_codex_config] 配置文件路径: {:?}", config_path);
+
     if !config_path.exists() {
+        println!("[load_codex_config] 配置文件不存在");
         return Err("Codex 配置文件不存在".to_string());
     }
 
     let content = std::fs::read_to_string(&config_path)
         .map_err(|err| format!("读取配置文件失败: {}", err))?;
 
-    let mut config: toml::Value = content.parse()
+    let config: toml::Value = content
+        .parse()
         .map_err(|err| format!("解析配置文件失败: {}", err))?;
 
-    if provider == "yunyi" {
-        // 切换到 yunyi 模式
-        config["model_provider"] = toml::Value::String("yunyi".to_string());
-        config["model"] = toml::Value::String("gpt-5.4".to_string());
-        config["preferred_auth_method"] = toml::Value::String("apikey".to_string());
+    println!("[load_codex_config] 当前 model_provider: {:?}", config.get("model_provider").map(|v| v.to_string()));
+    Ok((config_path, config))
+}
 
-        // 添加或更新 yunyi 配置
-        let mut yunyi_table = toml::map::Map::new();
-        yunyi_table.insert("name".to_string(), toml::Value::String("yunyi".to_string()));
-        yunyi_table.insert("base_url".to_string(), toml::Value::String("https://yunyi.rdzhvip.com/codex".to_string()));
-        yunyi_table.insert("wire_api".to_string(), toml::Value::String("responses".to_string()));
-        yunyi_table.insert("experimental_bearer_token".to_string(), toml::Value::String("963UQJE1-FZJP-XKQ5-P3CV-QHYCREJJB9K4".to_string()));
-        yunyi_table.insert("requires_openai_auth".to_string(), toml::Value::Boolean(true));
+fn persist_codex_config(config_path: &std::path::PathBuf, config: &toml::Value) -> Result<(), String> {
+    let new_content = toml::to_string_pretty(config).map_err(|err| format!("序列化配置失败: {}", err))?;
 
-        let mut providers = toml::map::Map::new();
-        providers.insert("yunyi".to_string(), toml::Value::Table(yunyi_table));
-        config["model_providers"] = toml::Value::Table(providers);
-    } else if provider == "account" {
-        // 切换到账号模式
-        config["model_provider"] = toml::Value::String("openai".to_string());
-        config["model"] = toml::Value::String("o3".to_string());
-        config["preferred_auth_method"] = toml::Value::String("bearer".to_string());
+    std::fs::write(config_path, new_content).map_err(|err| format!("写入配置文件失败: {}", err))?;
+    Ok(())
+}
 
-        // 移除 yunyi 配置（如果存在）
-        if let Some(providers) = config.get_mut("model_providers") {
-            if let Some(providers_table) = providers.as_table_mut() {
-                providers_table.remove("yunyi");
-            }
-        }
+fn resolve_official_model(config: &toml::Value) -> String {
+    let provider = config
+        .get("model_provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let model = config
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
+
+    if provider == "openai" && !model.is_empty() {
+        model.to_string()
     } else {
-        return Err("无效的 provider 参数".to_string());
+        OFFICIAL_MODEL_FALLBACK.to_string()
     }
+}
 
-    let new_content = toml::to_string_pretty(&config)
-        .map_err(|err| format!("序列化配置失败: {}", err))?;
+fn resolve_official_reasoning_effort(config: &toml::Value) -> String {
+    let provider = config
+        .get("model_provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    let effort = config
+        .get("model_reasoning_effort")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim();
 
-    std::fs::write(&config_path, new_content)
-        .map_err(|err| format!("写入配置文件失败: {}", err))?;
-
-    if provider == "yunyi" {
-        Ok("已切换到 yunyi 模式".to_string())
+    if provider == "openai" && !effort.is_empty() {
+        effort.to_string()
     } else {
-        Ok("已切换到 Codex 账号模式".to_string())
+        "high".to_string()
     }
 }
 
 #[tauri::command]
-async fn get_codex_provider() -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-    let config_path = home.join(".codex").join("config.toml");
+async fn switch_codex_provider(provider: String, profile: Option<ServiceProfilePayload>) -> Result<String, String> {
+    println!("[Rust switch_codex_provider] 开始切换, provider={}, profile={:?}", provider, profile.as_ref().map(|p| &p.name));
+    let (config_path, mut config) = load_codex_config()?;
+    let success_message = if provider == "openai" {
+        "已切换到官方账号模式".to_string()
+    } else {
+        let display_name = profile
+            .as_ref()
+            .map(|item| item.name.as_str())
+            .unwrap_or(provider.as_str());
+        format!("已切换到 API 服务: {}", display_name)
+    };
 
-    if !config_path.exists() {
-        return Ok("unknown".to_string());
+    println!("[Rust switch_codex_provider] 写入 config.model_provider = {}", provider);
+    if provider == "openai" {
+        config["model_provider"] = toml::Value::String("openai".to_string());
+        config["model"] = toml::Value::String(resolve_official_model(&config));
+        config["model_reasoning_effort"] =
+            toml::Value::String(resolve_official_reasoning_effort(&config));
+        config["disable_response_storage"] = toml::Value::Boolean(true);
+        config["preferred_auth_method"] = toml::Value::String("bearer".to_string());
+    } else {
+        let profile = profile.ok_or("缺少服务配置".to_string())?;
+        if profile.id != provider {
+            return Err("provider 与服务配置 ID 不一致".to_string());
+        }
+
+        config["model_provider"] = toml::Value::String(profile.id.clone());
+        config["model"] = toml::Value::String(profile.model.clone());
+        config["model_reasoning_effort"] = toml::Value::String(profile.reasoning_effort.clone());
+        config["disable_response_storage"] = toml::Value::Boolean(profile.disable_response_storage);
+        config["preferred_auth_method"] = toml::Value::String(profile.auth_method.clone());
+
+        let mut provider_table = toml::map::Map::new();
+        provider_table.insert("name".to_string(), toml::Value::String(profile.id.clone()));
+        provider_table.insert("base_url".to_string(), toml::Value::String(profile.base_url.clone()));
+        provider_table.insert("wire_api".to_string(), toml::Value::String(profile.wire_api.clone()));
+        provider_table.insert(
+            "requires_openai_auth".to_string(),
+            toml::Value::Boolean(profile.requires_openai_auth),
+        );
+
+        let bearer = profile.bearer_token.trim();
+        if !bearer.is_empty() {
+            provider_table.insert(
+                "experimental_bearer_token".to_string(),
+                toml::Value::String(bearer.to_string()),
+            );
+        }
+
+        let providers = config
+            .as_table_mut()
+            .ok_or("Codex 配置格式无效".to_string())?
+            .entry("model_providers")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+
+        let providers_table = providers
+            .as_table_mut()
+            .ok_or("model_providers 必须是表结构".to_string())?;
+        providers_table.insert(profile.id.clone(), toml::Value::Table(provider_table));
     }
 
-    let content = std::fs::read_to_string(&config_path)
-        .map_err(|err| format!("读取配置文件失败: {}", err))?;
+    println!("[Rust switch_codex_provider] 持久化配置到 {:?}", config_path);
+    persist_codex_config(&config_path, &config)?;
+    println!("[Rust switch_codex_provider] 切换成功: {}", success_message);
+    Ok(success_message)
+}
 
-    let config: toml::Value = content.parse()
-        .map_err(|err| format!("解析配置文件失败: {}", err))?;
+#[tauri::command]
+async fn get_codex_provider() -> Result<String, String> {
+    println!("[get_codex_provider] 被调用");
+    let Ok((_, config)) = load_codex_config() else {
+        println!("[get_codex_provider] 配置文件加载失败，返回 unknown");
+        return Ok("unknown".to_string());
+    };
 
     let provider = config.get("model_provider")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
+    println!("[get_codex_provider] 返回 provider: {}", provider);
     Ok(provider.to_string())
 }
 
@@ -272,7 +355,11 @@ pub fn run() {
                 }
             }
         })
-        .invoke_handler(tauri::generate_handler![fetch_wham_usage])
+        .invoke_handler(tauri::generate_handler![
+            fetch_wham_usage,
+            switch_codex_provider,
+            get_codex_provider
+        ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
 

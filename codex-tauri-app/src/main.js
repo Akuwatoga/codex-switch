@@ -9,17 +9,33 @@ let selectedAccount = null;
 let accounts = [];
 let isLoading = false;
 let PATHS = {};
+const DEFAULT_SERVICE_PROFILES = [
+    {
+        id: 'yunyi',
+        name: 'Yunyi',
+        baseUrl: 'https://yunyi.rdzhvip.com/codex',
+        wireApi: 'responses',
+        bearerToken: '963UQJE1-FZJP-XKQ5-P3CV-QHYCREJJB9K4',
+        requiresOpenaiAuth: true,
+        model: 'gpt-5.3-codex',
+        reasoningEffort: 'high',
+        authMethod: 'apikey',
+        disableResponseStorage: true
+    }
+];
 let appSettings = {
     maxLogEntries: 500,
     proxy: {
         proxyUrl: ''
     },
-    settingsVersion: 3,
+    settingsVersion: 4,
     // 全局认证模式: "auto" | "api_key" | "account"
     // auto: 根据账号配置自动判断
     // api_key: 强制使用 API Key
     // account: 强制使用账号模式
-    authMode: 'auto'
+    authMode: 'auto',
+    activeServiceProfile: DEFAULT_SERVICE_PROFILES[0].id,
+    serviceProfiles: cloneJson(DEFAULT_SERVICE_PROFILES)
 };
 let appLogs = [];
 let logWriteQueue = Promise.resolve();
@@ -30,12 +46,70 @@ const DEFAULT_SETTINGS = {
     proxy: {
         proxyUrl: ''
     },
-    settingsVersion: 3,
-    authMode: 'auto'
+    settingsVersion: 4,
+    authMode: 'auto',
+    activeServiceProfile: DEFAULT_SERVICE_PROFILES[0].id,
+    serviceProfiles: cloneJson(DEFAULT_SERVICE_PROFILES)
 };
 
 function cloneJson(data) {
     return data === undefined ? undefined : JSON.parse(JSON.stringify(data));
+}
+
+function normalizeServiceProfile(profile, index = 0) {
+    if (!profile || typeof profile !== 'object') return null;
+
+    const rawId = String(profile.id || '').trim().toLowerCase();
+    const id = rawId.replace(/[^a-z0-9_-]/g, '-').replace(/^-+|-+$/g, '') || `service-${index + 1}`;
+    const baseUrl = String(profile.baseUrl || '').trim();
+    if (!baseUrl) return null;
+
+    const authMethod = String(profile.authMethod || 'apikey').trim().toLowerCase();
+
+    return {
+        id,
+        name: String(profile.name || id).trim() || id,
+        baseUrl,
+        wireApi: String(profile.wireApi || 'responses').trim() || 'responses',
+        bearerToken: String(profile.bearerToken || '').trim(),
+        requiresOpenaiAuth: Boolean(profile.requiresOpenaiAuth ?? true),
+        model: String(profile.model || 'gpt-5.3-codex').trim() || 'gpt-5.3-codex',
+        reasoningEffort: String(profile.reasoningEffort || 'high').trim() || 'high',
+        authMethod: authMethod === 'bearer' ? 'bearer' : 'apikey',
+        disableResponseStorage: Boolean(profile.disableResponseStorage ?? true)
+    };
+}
+
+function normalizeServiceProfiles(profiles) {
+    const normalized = [];
+    const seen = new Set();
+
+    if (Array.isArray(profiles)) {
+        profiles.forEach((profile, index) => {
+            const item = normalizeServiceProfile(profile, index);
+            if (!item || seen.has(item.id)) return;
+            normalized.push(item);
+            seen.add(item.id);
+        });
+    }
+
+    return normalized.length ? normalized : cloneJson(DEFAULT_SERVICE_PROFILES);
+}
+
+function getServiceProfileById(profileId) {
+    const target = String(profileId || '').trim().toLowerCase();
+    return (appSettings.serviceProfiles || []).find((profile) => profile.id === target) || null;
+}
+
+function getActiveServiceProfile() {
+    // 空字符串表示官方账号模式，不应该 fallback 到服务配置
+    if (!appSettings.activeServiceProfile) {
+        console.log('[getActiveServiceProfile] activeServiceProfile 为空，返回 null（官方账号模式）');
+        return null;
+    }
+    const result = getServiceProfileById(appSettings.activeServiceProfile) || appSettings.serviceProfiles?.[0] || cloneJson(DEFAULT_SERVICE_PROFILES[0]);
+    console.log('[getActiveServiceProfile] activeServiceProfile=', appSettings.activeServiceProfile, '返回:', result?.id);
+    return result;
 }
 
 // =============================================================================
@@ -268,41 +342,64 @@ function hasAuthTokens(config) {
     return Boolean(tokens.refresh_token || tokens.access_token || tokens.id_token);
 }
 
+function parseIsoTimestamp(value) {
+    if (typeof value !== 'string' || !value.trim()) return 0;
+    const normalized = value.endsWith('Z') ? value : value;
+    const ts = Date.parse(normalized);
+    return Number.isFinite(ts) ? ts : 0;
+}
+
+function authFreshnessKey(config) {
+    if (!config || typeof config !== 'object') return [0, 0];
+    const payload = parseJwtPayload(config.tokens?.access_token);
+    const accessExp = Number.isFinite(payload?.exp) ? payload.exp : 0;
+    return [parseIsoTimestamp(config.last_refresh), accessExp];
+}
+
+function isFreshnessKeyGreater(left, right) {
+    if (left[0] !== right[0]) return left[0] > right[0];
+    return left[1] > right[1];
+}
+
+function selectBestAuthSnapshot(config, freshnessCandidates = []) {
+    let bestAuth = extractStoredAuth(config);
+    let bestKey = authFreshnessKey(bestAuth);
+
+    for (const candidate of freshnessCandidates) {
+        const candidateAuth = extractStoredAuth(candidate);
+        if (!Object.keys(candidateAuth).length || !sameAccount(bestAuth, candidateAuth)) continue;
+
+        const candidateKey = authFreshnessKey(candidateAuth);
+        if (isFreshnessKeyGreater(candidateKey, bestKey)) {
+            bestAuth = cloneJson(candidateAuth);
+            bestKey = candidateKey;
+        }
+    }
+
+    return cloneJson(bestAuth);
+}
+
 function detectAuthMode(config) {
     if (!config || typeof config !== 'object') return null;
-    if (config.auth_mode) return String(config.auth_mode);
-
     const apiKey = extractApiKey(config);
     const hasTokens = hasAuthTokens(config);
+    const rawAuthMode = config.auth_mode ? String(config.auth_mode) : null;
 
+    if (rawAuthMode === 'api_key') return 'api_key';
     if (apiKey && !hasTokens) return 'api_key';
     if (hasTokens) return 'account';
     if (apiKey) return 'api_key';
-    return null;
+    return rawAuthMode;
 }
 
 function prepareAuthForSwitch(config, forceMode = null) {
     const authSnapshot = extractStoredAuth(config);
-
-    // 优先级: forceMode > config.auth_mode > 全局设置 > 自动检测
-    let explicitMode = null;
-    if (forceMode) {
-        explicitMode = forceMode;
-    } else if (config && typeof config === 'object' && config.auth_mode) {
-        explicitMode = String(config.auth_mode);
-    } else if (appSettings.authMode && appSettings.authMode !== 'auto') {
-        explicitMode = appSettings.authMode;
-    }
-
-    const authMode = explicitMode || detectAuthMode(authSnapshot);
+    const authMode = forceMode || detectAuthMode(authSnapshot);
 
     if (authMode === 'api_key') {
         authSnapshot.auth_mode = 'api_key';
     } else {
-        if (hasAuthTokens(authSnapshot)) {
-            delete authSnapshot.OPENAI_API_KEY;
-        }
-        if (authSnapshot.auth_mode === 'api_key' || authMode === 'account') {
+        if (authSnapshot.auth_mode === 'api_key') {
             delete authSnapshot.auth_mode;
         }
     }
@@ -420,6 +517,14 @@ function normalizeSettings(rawSettings) {
         normalizedAuthMode = authMode;
     }
 
+    const serviceProfiles = normalizeServiceProfiles(rawSettings?.serviceProfiles);
+    const activeServiceProfileRaw = rawSettings?.activeServiceProfile;
+    // 空字符串表示官方账号模式，应该保留而不是 fallback 到 yunyi
+    const activeServiceProfile = activeServiceProfileRaw === '' || activeServiceProfileRaw === null || activeServiceProfileRaw === undefined
+        ? ''
+        : String(activeServiceProfileRaw || '').trim().toLowerCase();
+    const activeProfileExists = serviceProfiles.some((profile) => profile.id === activeServiceProfile);
+
     return {
         maxLogEntries: Number.isFinite(maxLogEntries)
             ? Math.max(50, Math.min(5000, Math.round(maxLogEntries)))
@@ -428,7 +533,9 @@ function normalizeSettings(rawSettings) {
             proxyUrl
         },
         settingsVersion: DEFAULT_SETTINGS.settingsVersion,
-        authMode: normalizedAuthMode
+        authMode: normalizedAuthMode,
+        activeServiceProfile: activeServiceProfile === '' ? '' : (activeProfileExists ? activeServiceProfile : serviceProfiles[0].id),
+        serviceProfiles
     };
 }
 
@@ -439,6 +546,210 @@ async function loadSettings() {
 
 async function saveSettings() {
     await writeJsonFileNoThrow(PATHS.settingsFile, appSettings);
+}
+
+function upsertEditingServiceProfile() {
+    const profileSelect = document.getElementById('service-profile-select');
+    const profileIdInput = document.getElementById('service-profile-id');
+    const profileNameInput = document.getElementById('service-profile-name');
+    const profileBaseUrlInput = document.getElementById('service-profile-base-url');
+    const profileWireApiInput = document.getElementById('service-profile-wire-api');
+    const profileTokenInput = document.getElementById('service-profile-token');
+    const profileModelInput = document.getElementById('service-profile-model');
+    const profileReasoningInput = document.getElementById('service-profile-reasoning');
+    const profileAuthMethodSelect = document.getElementById('service-profile-auth-method');
+    const profileRequiresOpenaiAuthInput = document.getElementById('service-profile-requires-openai-auth');
+    const profileDisableStorageInput = document.getElementById('service-profile-disable-storage');
+
+    const selectedId = profileSelect?.value || appSettings.activeServiceProfile;
+    const existing = getServiceProfileById(selectedId) || {};
+    const normalized = normalizeServiceProfile({
+        ...existing,
+        id: profileIdInput?.value || existing.id,
+        name: profileNameInput?.value || existing.name,
+        baseUrl: profileBaseUrlInput?.value || existing.baseUrl,
+        wireApi: profileWireApiInput?.value || existing.wireApi,
+        bearerToken: profileTokenInput?.value || existing.bearerToken,
+        model: profileModelInput?.value || existing.model,
+        reasoningEffort: profileReasoningInput?.value || existing.reasoningEffort,
+        authMethod: profileAuthMethodSelect?.value || existing.authMethod,
+        requiresOpenaiAuth: profileRequiresOpenaiAuthInput?.checked ?? existing.requiresOpenaiAuth,
+        disableResponseStorage: profileDisableStorageInput?.checked ?? existing.disableResponseStorage
+    });
+
+    if (!normalized) {
+        throw new Error('API 服务配置至少需要有效的 Provider ID 和 Base URL');
+    }
+
+    const nextProfiles = [];
+    let replaced = false;
+    for (const profile of appSettings.serviceProfiles || []) {
+        if (profile.id === selectedId) {
+            if (!nextProfiles.some((item) => item.id === normalized.id)) {
+                nextProfiles.push(normalized);
+            }
+            replaced = true;
+            continue;
+        }
+        if (profile.id === normalized.id) {
+            continue;
+        }
+        nextProfiles.push(profile);
+    }
+
+    if (!replaced && !nextProfiles.some((item) => item.id === normalized.id)) {
+        nextProfiles.push(normalized);
+    }
+
+    appSettings.serviceProfiles = normalizeServiceProfiles(nextProfiles);
+    appSettings.activeServiceProfile = normalized.id;
+    return normalized;
+}
+
+function renderServiceProfileEditor() {
+    const profileSelect = document.getElementById('service-profile-select');
+    if (!profileSelect) return;
+
+    const profiles = normalizeServiceProfiles(appSettings.serviceProfiles);
+    appSettings.serviceProfiles = profiles;
+
+    const activeProfile = getActiveServiceProfile();
+    console.log('[renderServiceProfileEditor] activeProfile:', activeProfile?.id, '| activeServiceProfile:', appSettings.activeServiceProfile);
+
+    profileSelect.innerHTML = profiles
+        .map((profile) => `<option value="${profile.id}">${profile.name} (${profile.id})</option>`)
+        .join('');
+    // 官方账号模式时 activeProfile 为 null，select 显示为空（用户需先选择服务才能编辑）
+    profileSelect.value = activeProfile?.id || '';
+
+    // 官方账号模式下不填充服务配置字段
+    if (!activeProfile) {
+        ['service-profile-id', 'service-profile-name', 'service-profile-base-url',
+         'service-profile-wire-api', 'service-profile-token', 'service-profile-model',
+         'service-profile-reasoning'].forEach(id => {
+            const input = document.getElementById(id);
+            if (input) input.value = '';
+        });
+        const authMethodSelect = document.getElementById('service-profile-auth-method');
+        if (authMethodSelect) authMethodSelect.value = 'apikey';
+        const requiresOpenaiAuthInput = document.getElementById('service-profile-requires-openai-auth');
+        if (requiresOpenaiAuthInput) requiresOpenaiAuthInput.checked = true;
+        const disableStorageInput = document.getElementById('service-profile-disable-storage');
+        if (disableStorageInput) disableStorageInput.checked = true;
+        return;
+    }
+
+    const fieldMap = {
+        'service-profile-id': activeProfile.id,
+        'service-profile-name': activeProfile.name,
+        'service-profile-base-url': activeProfile.baseUrl,
+        'service-profile-wire-api': activeProfile.wireApi,
+        'service-profile-token': activeProfile.bearerToken,
+        'service-profile-model': activeProfile.model,
+        'service-profile-reasoning': activeProfile.reasoningEffort
+    };
+
+    Object.entries(fieldMap).forEach(([id, value]) => {
+        const input = document.getElementById(id);
+        if (input) input.value = value ?? '';
+    });
+
+    const authMethodSelect = document.getElementById('service-profile-auth-method');
+    if (authMethodSelect) authMethodSelect.value = activeProfile.authMethod || 'apikey';
+
+    const requiresOpenaiAuthInput = document.getElementById('service-profile-requires-openai-auth');
+    if (requiresOpenaiAuthInput) requiresOpenaiAuthInput.checked = Boolean(activeProfile.requiresOpenaiAuth);
+
+    const disableStorageInput = document.getElementById('service-profile-disable-storage');
+    if (disableStorageInput) disableStorageInput.checked = Boolean(activeProfile.disableResponseStorage);
+}
+
+function renderProviderOptions(selectedProvider = null) {
+    const providerSelect = document.getElementById('provider-select');
+    if (!providerSelect) return;
+
+    const selectedValue = selectedProvider || providerSelect.value || 'official';
+    const profiles = appSettings.serviceProfiles || [];
+    const profileOptions = profiles
+        .map((profile) => `<option value="${profile.id}">${profile.name}</option>`)
+        .join('');
+
+    providerSelect.innerHTML = `<option value="official">官方账号</option>${profileOptions}`;
+
+    if (selectedValue !== 'official' && !profiles.some((profile) => profile.id === selectedValue)) {
+        providerSelect.insertAdjacentHTML('beforeend', `<option value="${selectedValue}">${selectedValue} (当前)</option>`);
+    }
+
+    providerSelect.value = selectedValue;
+}
+
+function handleServiceProfileSelectionChange(profileId) {
+    try {
+        upsertEditingServiceProfile();
+    } catch (_) {
+        // 切换编辑对象时允许当前输入暂时未完成
+    }
+
+    const normalizedId = String(profileId || '').trim().toLowerCase();
+    // 如果是官方账号模式（空选择），保持空值不 fallback
+    appSettings.activeServiceProfile = normalizedId || '';
+    renderServiceProfileEditor();
+    renderProviderOptions(appSettings.activeServiceProfile);
+}
+
+function createServiceProfile() {
+    try {
+        upsertEditingServiceProfile();
+    } catch (_) {
+        // 当前项未填完整时，保留现状并继续创建新项
+    }
+
+    let index = (appSettings.serviceProfiles || []).length + 1;
+    let nextId = `service-${index}`;
+    while (getServiceProfileById(nextId)) {
+        index += 1;
+        nextId = `service-${index}`;
+    }
+
+    appSettings.serviceProfiles = normalizeServiceProfiles([
+        ...(appSettings.serviceProfiles || []),
+        {
+            id: nextId,
+            name: `Service ${index}`,
+            baseUrl: 'https://example.com/codex',
+            wireApi: 'responses',
+            bearerToken: '',
+            requiresOpenaiAuth: true,
+            model: 'gpt-5.3-codex',
+            reasoningEffort: 'high',
+            authMethod: 'apikey',
+            disableResponseStorage: true
+        }
+    ]);
+    appSettings.activeServiceProfile = nextId;
+    renderServiceProfileEditor();
+    renderProviderOptions(nextId);
+}
+
+function deleteCurrentServiceProfile() {
+    const profiles = appSettings.serviceProfiles || [];
+    if (profiles.length <= 1) {
+        showMessage('至少保留一个 API 服务配置', 'error');
+        return;
+    }
+
+    // 官方账号模式下没有活动的服务配置，无需删除
+    const activeProfile = getActiveServiceProfile();
+    if (!activeProfile) {
+        showMessage('官方账号模式下无需删除服务配置', 'error');
+        return;
+    }
+
+    const activeId = activeProfile.id;
+    appSettings.serviceProfiles = profiles.filter((profile) => profile.id !== activeId);
+    appSettings.activeServiceProfile = appSettings.serviceProfiles[0].id;
+    renderServiceProfileEditor();
+    renderProviderOptions('official');
 }
 
 function trimLogs(logs) {
@@ -526,6 +837,7 @@ function renderSettingsLogs() {
     const maxLogEntries = document.getElementById('max-log-entries');
     const proxyUrl = document.getElementById('proxy-url');
     const authModeSelect = document.getElementById('auth-mode-select');
+    const activeServiceProfile = document.getElementById('service-profile-select');
 
     if (logEntryCount) {
         logEntryCount.textContent = String(appLogs.length);
@@ -552,6 +864,10 @@ function renderSettingsLogs() {
 
     if (authModeSelect) {
         authModeSelect.value = appSettings.authMode || 'auto';
+    }
+
+    if (activeServiceProfile) {
+        renderServiceProfileEditor();
     }
 
     if (logContent) {
@@ -585,17 +901,32 @@ async function saveSettingsModal() {
     const proxyUrl = document.getElementById('proxy-url');
     const authModeSelect = document.getElementById('auth-mode-select');
     const nextValue = Number(input?.value);
+    let activeServiceProfile = appSettings.activeServiceProfile;
+    let serviceProfiles = appSettings.serviceProfiles;
+
+    try {
+        const currentProfile = upsertEditingServiceProfile();
+        activeServiceProfile = currentProfile.id;
+        serviceProfiles = appSettings.serviceProfiles;
+    } catch (e) {
+        showMessage(e.message || 'API 服务配置无效', 'error');
+        return;
+    }
+
     appSettings = normalizeSettings({
         maxLogEntries: nextValue,
         proxy: {
             proxyUrl: proxyUrl?.value || ''
         },
-        authMode: authModeSelect?.value || 'auto'
+        authMode: authModeSelect?.value || 'auto',
+        activeServiceProfile,
+        serviceProfiles
     });
     appLogs = trimLogs(appLogs);
     await saveSettings();
     await persistLogs();
     renderSettingsLogs();
+    renderProviderOptions();
     showMessage('设置已保存', 'success');
 }
 
@@ -931,25 +1262,6 @@ async function quickSwitchAccount(accountName) {
         return;
     }
 
-    // 获取当前的连接模式（从下拉框）
-    const providerSelect = document.getElementById('provider-select');
-    const currentProvider = providerSelect ? providerSelect.value : 'account';
-    console.log('当前连接模式:', currentProvider);
-
-    // 如果是 yunyi 模式，先切换到账号模式
-    if (currentProvider === 'yunyi') {
-        try {
-            console.log('当前是 yunyi 模式，切换到账号模式...');
-            await invoke('switch_codex_provider', { provider: 'account' });
-            updateProviderSelect('account');
-            showMessage('已切换到账号模式，正在切换账号...', 'success');
-        } catch (e) {
-            console.error('切换 provider 失败:', e);
-            showMessage('切换模式失败: ' + e, 'error');
-            return;
-        }
-    }
-
     // 检测账号支持的认证模式
     const authSnapshot = extractStoredAuth(account.config);
     const hasApiKey = extractApiKey(authSnapshot);
@@ -1037,9 +1349,21 @@ async function quickSwitchAccount(accountName) {
         console.log('账号配置:', account.config);
         console.log('使用模式:', forceMode);
 
-        const cleanConfig = prepareAuthForSwitch(account.config, forceMode);
-
         const currentSystemConfig = await readJsonSafe(PATHS.systemAuthFile);
+        const systemBackupConfig = await readJsonSafe(`${PATHS.systemAuthFile}.backup`);
+        const selectedSnapshot = selectBestAuthSnapshot(account.config, [
+            currentSystemConfig,
+            systemBackupConfig
+        ].filter(Boolean));
+        const cleanConfig = prepareAuthForSwitch(selectedSnapshot, forceMode);
+
+        if (JSON.stringify(selectedSnapshot) !== JSON.stringify(extractStoredAuth(account.config))) {
+            const repairedRecord = buildStoredAccountRecord(selectedSnapshot, accountName);
+            await writeJsonSafe(account.path, repairedRecord);
+            account.config = repairedRecord;
+            console.log('♻️ 已用系统中的更新认证修复账号快照');
+        }
+
         if (currentSystemConfig) {
             await writeJsonSafe(`${PATHS.systemAuthFile}.backup`, currentSystemConfig);
         }
@@ -1049,9 +1373,14 @@ async function quickSwitchAccount(accountName) {
         console.log('✅ 系统配置写入成功');
 
         const modeText = forceMode === 'api_key' ? 'API Key' : (forceMode === 'account' ? '账号 Token' : '自动');
-        showMessage(`已切换到账号 ${accountName} (${modeText}模式)，请完全退出 Codex 并重新打开`, 'success');
+        const providerSelect = document.getElementById('provider-select');
+        const currentProvider = providerSelect?.value || 'official';
+        const providerProfile = currentProvider === 'official' ? null : getServiceProfileById(currentProvider);
+        const providerText = providerProfile ? `，当前 API 服务为 ${providerProfile.name}` : '，当前连接为官方账号';
+        showMessage(`已切换到账号 ${accountName} (${modeText}模式)${providerText}，请完全退出 Codex 并重新打开`, 'success');
         selectedAccount = null;
         await loadAccounts();
+        await loadProviderStatus(); // 刷新 provider 状态
     } catch (e) {
         console.error('❌ 切换账号错误:', e);
         showMessage('切换账号失败: ' + (e.message || String(e)), 'error');
@@ -1531,29 +1860,57 @@ function refreshData() {
 }
 
 // =============================================================================
-// Provider 切换 (yunyi / 账号模式)
+// Provider 切换 (官方账号 / API 服务)
 // =============================================================================
 
 async function loadProviderStatus() {
+    console.log('[loadProviderStatus] 开始加载 provider 状态');
+    console.log('[loadProviderStatus] 当前 appSettings.activeServiceProfile:', appSettings.activeServiceProfile);
     try {
         const provider = await invoke('get_codex_provider');
+        console.log('[loadProviderStatus] 从系统获取到 provider:', provider);
         updateProviderSelect(provider);
     } catch (e) {
-        console.error('获取 provider 状态失败:', e);
+        console.error('[loadProviderStatus] 获取 provider 状态失败:', e);
+        // 即使失败也设置默认值
+        updateProviderSelect('openai');
     }
 }
 
 function updateProviderSelect(provider) {
-    const select = document.getElementById('provider-select');
-    if (select) {
-        select.value = provider === 'yunyi' ? 'yunyi' : 'account';
+    console.log('[updateProviderSelect] 被调用, provider:', provider);
+    console.log('[updateProviderSelect] 当前 appSettings.serviceProfiles:', appSettings.serviceProfiles.map(p => p.id));
+    const providerValue = provider === 'openai' || provider === 'unknown' ? 'official' : provider;
+    console.log('[updateProviderSelect] 转换后的 providerValue:', providerValue);
+    renderProviderOptions(providerValue);
+
+    // 更新状态指示器
+    const statusEl = document.getElementById('provider-status');
+    const statusText = document.getElementById('status-text');
+    if (statusEl && statusText) {
+        const serviceProfile = providerValue === 'official' ? null : getServiceProfileById(providerValue);
+        console.log('[updateProviderSelect] serviceProfile:', serviceProfile);
+        statusEl.className = 'provider-status ' + (serviceProfile ? 'service' : 'official');
+        statusText.textContent = serviceProfile ? serviceProfile.name : '官方账号';
+        console.log('[updateProviderSelect] 状态文本设置为:', statusText.textContent);
     }
 }
 
 async function handleProviderChange(newProvider) {
+    console.log('[ProviderSwitch] ========== 开始切换 Provider ==========');
+    console.log('[ProviderSwitch] 用户选择:', newProvider);
+    console.log('[ProviderSwitch] 切换前 activeServiceProfile:', appSettings.activeServiceProfile);
+    console.log('[ProviderSwitch] 切换前系统配置 provider:', await invoke('get_codex_provider').catch(() => '获取失败'));
+    console.log('[ProviderSwitch] 所有服务配置:', JSON.stringify(appSettings.serviceProfiles.map(p => ({ id: p.id, name: p.name }))));
+
     try {
+        const serviceProfile = newProvider === 'official' ? null : getServiceProfileById(newProvider);
+        const nextLabel = serviceProfile ? serviceProfile.name : '官方账号';
+        console.log('[ProviderSwitch] 解析后的 serviceProfile:', serviceProfile);
+        console.log('[ProviderSwitch] 将切换到:', nextLabel);
+
         const confirmed = await confirm(
-            `确定要切换到 ${newProvider === 'yunyi' ? 'Yunyi' : '账号'} 模式吗？\n\n切换后需要完全退出 Codex 并重新打开才能生效。`,
+            `确定要切换到 ${nextLabel} 吗？\n\n切换后需要完全退出 Codex 并重新打开才能生效。`,
             {
                 title: '切换连接模式',
                 type: 'warning',
@@ -1563,18 +1920,39 @@ async function handleProviderChange(newProvider) {
         );
 
         if (!confirmed) {
+            console.log('[ProviderSwitch] 用户取消切换');
             // 恢复原来的选择
             const currentProvider = await invoke('get_codex_provider');
             updateProviderSelect(currentProvider);
             return;
         }
 
-        showMessage(`正在切换到 ${newProvider === 'yunyi' ? 'Yunyi' : '账号'} 模式...`, 'success');
+        showMessage(`正在切换到 ${nextLabel}...`, 'success');
 
-        const result = await invoke('switch_codex_provider', { provider: newProvider });
+        console.log('[ProviderSwitch] 调用 Rust 后端 switch_codex_provider, provider:', serviceProfile ? serviceProfile.id : 'openai');
+        const result = await invoke('switch_codex_provider', {
+            provider: serviceProfile ? serviceProfile.id : 'openai',
+            profile: serviceProfile ? serviceProfile : null
+        });
+        console.log('[ProviderSwitch] Rust 后端返回:', result);
+        console.log('[ProviderSwitch] 切换后系统配置 provider:', await invoke('get_codex_provider').catch(() => '获取失败'));
+
+        if (serviceProfile) {
+            appSettings.activeServiceProfile = serviceProfile.id;
+            console.log('[ProviderSwitch] 设置 activeServiceProfile =', serviceProfile.id);
+        } else {
+            // 切换到官方账号时，清除 activeServiceProfile，让 loadProviderStatus 使用系统真实状态
+            appSettings.activeServiceProfile = '';
+            console.log('[ProviderSwitch] 设置 activeServiceProfile = "" (官方账号模式)');
+        }
+        await saveSettings();
+        console.log('[ProviderSwitch] 设置已保存');
+        console.log('[ProviderSwitch] 调用 updateProviderSelect, 参数:', serviceProfile ? serviceProfile.id : 'openai');
         showMessage(result + '，请完全退出 Codex 并重新打开', 'success');
+        updateProviderSelect(serviceProfile ? serviceProfile.id : 'openai');
+        console.log('[ProviderSwitch] ========== 切换完成 ==========');
     } catch (e) {
-        console.error('切换 provider 失败:', e);
+        console.error('[ProviderSwitch] 切换失败:', e);
         // 恢复原来的选择
         const currentProvider = await invoke('get_codex_provider');
         updateProviderSelect(currentProvider);
@@ -1623,3 +2001,7 @@ window.handleSettingsOverlayClick = handleSettingsOverlayClick;
 window.saveSettingsModal = saveSettingsModal;
 window.refreshSettingsLogs = refreshSettingsLogs;
 window.clearErrorLogs = clearErrorLogs;
+window.handleProviderChange = handleProviderChange;
+window.handleServiceProfileSelectionChange = handleServiceProfileSelectionChange;
+window.createServiceProfile = createServiceProfile;
+window.deleteCurrentServiceProfile = deleteCurrentServiceProfile;

@@ -6,18 +6,24 @@ OpenAI Codex 账号配置管理器 - Web版本
 """
 
 import json
+import re
 import shutil
 import webbrowser
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
 from urllib.parse import parse_qs
+
+import toml
 from codex_auth import (
     build_account_record,
     extract_account_id_from_auth,
     extract_api_key_from_auth,
     extract_email_from_auth,
     extract_plan_from_auth,
+    extract_stored_auth,
     prepare_auth_for_switch,
+    select_best_auth_snapshot,
     same_account,
 )
 from usage_checker import OpenAIUsageChecker
@@ -32,10 +38,179 @@ class CodexAccountManagerWeb:
         self.auth_file = config['auth_file']
         self.accounts_dir = config['accounts_dir']
         self.system_auth_file = config['system_auth_file']
+        self.codex_config_file = Path.home() / ".codex" / "config.toml"
         
         # 确保目录存在
         self.codex_dir.mkdir(parents=True, exist_ok=True)
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
+
+    def _load_json_if_exists(self, path):
+        try:
+            if path.exists():
+                with open(path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception:
+            return None
+        return None
+
+    def _load_toml_if_exists(self, path):
+        try:
+            if path.exists():
+                with open(path, 'r', encoding='utf-8') as f:
+                    return toml.load(f)
+        except Exception:
+            return None
+        return None
+
+    def _deep_merge_dict(self, base, incoming):
+        merged = dict(base)
+        for key, value in incoming.items():
+            if isinstance(value, dict) and isinstance(merged.get(key), dict):
+                merged[key] = self._deep_merge_dict(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+
+    def _normalize_account_name(self, account_name):
+        raw_name = str(account_name or '').strip()
+        if not raw_name:
+            return None
+
+        sanitized = re.sub(r'[^\w-]', '_', raw_name, flags=re.UNICODE).strip('_')
+        return sanitized or None
+
+    def _extract_imported_codex_config(self, account_record):
+        if not isinstance(account_record, dict):
+            return None
+
+        manager_meta = account_record.get('_manager')
+        if not isinstance(manager_meta, dict):
+            return None
+
+        codex_config = manager_meta.get('codex_config')
+        if isinstance(codex_config, dict) and codex_config:
+            return codex_config
+        return None
+
+    def _attach_imported_codex_config(self, account_record, codex_config):
+        if not isinstance(account_record, dict) or not isinstance(codex_config, dict) or not codex_config:
+            return account_record
+
+        manager_meta = account_record.get('_manager')
+        if not isinstance(manager_meta, dict):
+            manager_meta = {}
+
+        manager_meta['codex_config'] = codex_config
+        account_record['_manager'] = manager_meta
+        return account_record
+
+    def _parse_imported_codex_config(self, config_toml_content):
+        raw_content = self._unwrap_code_block(str(config_toml_content or '').strip())
+        if not raw_content:
+            return None
+
+        try:
+            parsed = toml.loads(raw_content)
+        except Exception as e:
+            raise ValueError(f"config.toml 格式错误: {e}")
+
+        if not isinstance(parsed, dict):
+            raise ValueError("config.toml 内容无效")
+
+        allow_keys = [
+            "model_provider",
+            "model",
+            "review_model",
+            "model_reasoning_effort",
+            "disable_response_storage",
+            "network_access",
+            "windows_wsl_setup_acknowledged",
+            "model_context_window",
+            "model_auto_compact_token_limit",
+            "preferred_auth_method",
+        ]
+        normalized = {}
+        for key in allow_keys:
+            if key in parsed:
+                normalized[key] = parsed[key]
+
+        model_providers = parsed.get("model_providers")
+        if isinstance(model_providers, dict) and model_providers:
+            selected_provider = str(normalized.get("model_provider") or parsed.get("model_provider") or "").strip()
+            matched_provider_key = None
+
+            if selected_provider and isinstance(model_providers.get(selected_provider), dict):
+                matched_provider_key = selected_provider
+            elif selected_provider:
+                for provider_key, provider_config in model_providers.items():
+                    if str(provider_key).lower() == selected_provider.lower() and isinstance(provider_config, dict):
+                        matched_provider_key = provider_key
+                        break
+
+            if matched_provider_key:
+                normalized["model_provider"] = selected_provider or str(matched_provider_key)
+                normalized["model_providers"] = {
+                    matched_provider_key: model_providers[matched_provider_key]
+                }
+            else:
+                valid_providers = {
+                    provider_key: provider_config
+                    for provider_key, provider_config in model_providers.items()
+                    if isinstance(provider_config, dict)
+                }
+                if valid_providers:
+                    normalized["model_providers"] = valid_providers
+
+        if not normalized:
+            raise ValueError("config.toml 中未找到可导入字段")
+
+        return normalized
+
+    def _unwrap_code_block(self, text):
+        raw = str(text or '').strip()
+        if raw.startswith("```") and raw.endswith("```"):
+            lines = raw.splitlines()
+            if len(lines) >= 3:
+                return "\n".join(lines[1:-1]).strip()
+        return raw
+
+    def _parse_auth_json_content(self, auth_json_content):
+        raw = self._unwrap_code_block(str(auth_json_content or '').strip())
+        if not raw:
+            raise ValueError("auth.json 内容不能为空")
+
+        try:
+            auth_config = json.loads(raw)
+            if isinstance(auth_config, dict):
+                return auth_config
+        except json.JSONDecodeError:
+            pass
+
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end > start:
+            json_part = raw[start:end + 1]
+            try:
+                auth_config = json.loads(json_part)
+                if isinstance(auth_config, dict):
+                    return auth_config
+            except json.JSONDecodeError:
+                pass
+
+        raise ValueError("auth.json 格式错误，请检查 JSON")
+
+    def _apply_imported_codex_config(self, imported_codex_config):
+        if not isinstance(imported_codex_config, dict) or not imported_codex_config:
+            return
+
+        current_config = self._load_toml_if_exists(self.codex_config_file) or {}
+        if not isinstance(current_config, dict):
+            current_config = {}
+
+        merged_config = self._deep_merge_dict(current_config, imported_codex_config)
+        self.codex_config_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.codex_config_file, 'w', encoding='utf-8') as f:
+            toml.dump(merged_config, f)
     
     def extract_email_from_token(self, config):
         """从token中提取邮箱地址"""
@@ -127,6 +302,46 @@ class CodexAccountManagerWeb:
         except Exception as e:
             return {"error": f"保存失败: {e}"}
 
+    def import_config_bundle(self, account_name, auth_json_content, config_toml_content=None):
+        """导入账号配置，可同时绑定 config.toml 接口配置"""
+        try:
+            auth_config = self._parse_auth_json_content(auth_json_content)
+
+            imported_codex_config = None
+            if str(config_toml_content or "").strip():
+                imported_codex_config = self._parse_imported_codex_config(config_toml_content)
+
+            normalized_name = self._normalize_account_name(account_name)
+            if not normalized_name:
+                email = self.extract_email_from_token(auth_config)
+                account_id = extract_account_id_from_auth(auth_config)
+                api_key = extract_api_key_from_auth(auth_config)
+                account_seed = email or account_id or (f"api_key_{api_key[-6:]}" if api_key else None)
+                if not account_seed:
+                    return {"error": "账号名称为空且 auth.json 缺少可识别账号标识"}
+                normalized_name = generate_account_name(account_seed)
+
+            account_record = build_account_record(
+                auth_config,
+                normalized_name,
+                saved_at=datetime.now().isoformat(),
+            )
+            self._attach_imported_codex_config(account_record, imported_codex_config)
+            account_file = self.accounts_dir / f"{normalized_name}.json"
+            with open(account_file, 'w', encoding='utf-8') as f:
+                json.dump(account_record, f, indent=2, ensure_ascii=False)
+
+            message = f"成功导入账号配置: {normalized_name}"
+            if imported_codex_config:
+                message += "（已绑定接口配置，切换账号时会自动同步到 ~/.codex/config.toml）"
+
+            return {"success": message}
+
+        except ValueError as e:
+            return {"error": str(e)}
+        except Exception as e:
+            return {"error": f"导入失败: {e}"}
+
 
     def switch_account(self, account_name, force_mode=None):
         """切换到指定账号"""
@@ -139,18 +354,37 @@ class CodexAccountManagerWeb:
             # 读取目标账号配置
             with open(account_file, 'r', encoding='utf-8') as f:
                 target_config = json.load(f)
+
+            imported_codex_config = self._extract_imported_codex_config(target_config)
             
-            clean_config = prepare_auth_for_switch(target_config, force_mode=force_mode)
-            
-            if self.system_auth_file.exists():
-                backup_file = self.system_auth_file.with_suffix('.json.backup')
-                shutil.copy2(self.system_auth_file, backup_file)
+            freshness_candidates = [
+                self._load_json_if_exists(self.system_auth_file),
+                self._load_json_if_exists(self.system_auth_file.with_suffix('.json.backup')),
+            ]
+            selected_snapshot = select_best_auth_snapshot(
+                target_config,
+                freshness_candidates=[item for item in freshness_candidates if item],
+            )
+            clean_config = prepare_auth_for_switch(selected_snapshot, force_mode=force_mode)
+
+            if selected_snapshot != extract_stored_auth(target_config):
+                target_config = build_account_record(selected_snapshot, account_name, saved_at=datetime.now().isoformat())
+                self._attach_imported_codex_config(target_config, imported_codex_config)
+                with open(account_file, 'w', encoding='utf-8') as f:
+                    json.dump(target_config, f, indent=2, ensure_ascii=False)
 
             # 直接写入系统 Codex 配置
             self.system_auth_file.parent.mkdir(parents=True, exist_ok=True)
+            if self.system_auth_file.exists():
+                backup_file = self.system_auth_file.with_suffix('.json.backup')
+                shutil.copy2(self.system_auth_file, backup_file)
             with open(self.system_auth_file, 'w', encoding='utf-8') as f:
                 json.dump(clean_config, f, indent=2, ensure_ascii=False)
-            
+
+            if imported_codex_config:
+                self._apply_imported_codex_config(imported_codex_config)
+                return {"success": f"成功切换到账号: {account_name}（已同步接口配置）"}
+
             return {"success": f"成功切换到账号: {account_name}"}
             
         except Exception as e:
@@ -245,19 +479,7 @@ class CodexAccountManagerWeb:
 
     def add_config(self, account_name, config_content):
         """添加配置文件"""
-        try:
-            config = json.loads(config_content)
-            account_record = build_account_record(config, account_name, saved_at=datetime.now().isoformat())
-            account_file = self.accounts_dir / f"{account_name}.json"
-            with open(account_file, 'w', encoding='utf-8') as f:
-                json.dump(account_record, f, indent=2, ensure_ascii=False)
-            
-            return {"success": f"成功保存账号配置: {account_name}"}
-            
-        except json.JSONDecodeError:
-            return {"error": "配置内容格式错误，请检查JSON格式"}
-        except Exception as e:
-            return {"error": f"保存失败: {e}"}
+        return self.import_config_bundle(account_name, config_content, None)
 
     def refresh_current_usage(self):
         """手动刷新当前账号的用量（从官方接口读取并更新缓存）"""
@@ -340,6 +562,17 @@ class WebHandler(BaseHTTPRequestHandler):
             account_name = data.get('account_name', [''])[0]
             config_content = data.get('config_content', [''])[0]
             result = self.manager.add_config(account_name, config_content)
+            self.send_json_response(result)
+        elif self.path == '/api/import_config':
+            data = parse_qs(post_data)
+            account_name = data.get('account_name', [''])[0]
+            auth_content = data.get('auth_content', [''])[0]
+            codex_config_content = data.get('codex_config_content', [''])[0]
+            result = self.manager.import_config_bundle(
+                account_name=account_name,
+                auth_json_content=auth_content,
+                config_toml_content=codex_config_content,
+            )
             self.send_json_response(result)
         else:
             self.send_error(404)
@@ -896,20 +1129,27 @@ class WebHandler(BaseHTTPRequestHandler):
                 
                 <div class="collapsible" id="add-config-section">
                     <div class="collapsible-header" onclick="toggleCollapsible('add-config-section')">
-                        <span>添加配置文件</span>
+                        <span>导入配置（auth + 接口）</span>
                         <span>▼</span>
                     </div>
                     <div class="collapsible-content">
                         <div class="input-group">
-                            <label>账号名称:</label>
-                            <input type="text" id="config-name" placeholder="输入账号名称">
+                            <label>账号名称（可选）:</label>
+                            <input type="text" id="config-name" placeholder="不填则自动生成，例如邮箱名前缀">
                         </div>
                         <div class="input-group">
-                            <label>配置内容:</label>
-                            <textarea id="config-content" rows="6" placeholder="粘贴完整的 auth.json 配置内容"></textarea>
+                            <label>config.toml 内容（可选）:</label>
+                            <textarea id="codex-config-content" rows="8" placeholder="粘贴 model_provider / model_providers 的配置片段"></textarea>
                         </div>
-                        <button class="btn btn-success" onclick="addConfig()" style="width: 100%;">
-                            保存配置
+                        <div class="input-group">
+                            <label>auth.json 内容（必填）:</label>
+                            <textarea id="auth-content" rows="8" placeholder='例如: {"OPENAI_API_KEY": "sk-..."} 或完整 token 配置'></textarea>
+                        </div>
+                        <div style="font-size: 12px; color: var(--text-light); margin-bottom: 12px;">
+                            导入后会保存为可切换账号；如果填写了 config.toml，后续切换该账号时会自动同步接口配置。
+                        </div>
+                        <button class="btn btn-success" onclick="importConfig()" style="width: 100%;">
+                            导入并保存
                         </button>
                     </div>
                 </div>
@@ -1355,29 +1595,31 @@ class WebHandler(BaseHTTPRequestHandler):
             }
         }
 
-        async function addConfig() {
+        async function importConfig() {
             const accountName = document.getElementById('config-name').value.trim();
-            const configContent = document.getElementById('config-content').value.trim();
+            const authContent = document.getElementById('auth-content').value.trim();
+            const codexConfigContent = document.getElementById('codex-config-content').value.trim();
 
-            if (!accountName || !configContent) {
-                showMessage('请输入账号名称和配置内容', 'error');
+            if (!authContent) {
+                showMessage('请填写 auth.json 内容', 'error');
                 return;
             }
 
             try {
-                showMessage('正在保存配置...', 'success');
+                showMessage('正在导入配置...', 'success');
                 
-                const response = await fetch('/api/add_config', {
+                const response = await fetch('/api/import_config', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: `account_name=${encodeURIComponent(accountName)}&config_content=${encodeURIComponent(configContent)}`
+                    body: `account_name=${encodeURIComponent(accountName)}&auth_content=${encodeURIComponent(authContent)}&codex_config_content=${encodeURIComponent(codexConfigContent)}`
                 });
                 const result = await response.json();
                 
                 if (result.success) {
                     showMessage(`${result.success}`);
                     document.getElementById('config-name').value = '';
-                    document.getElementById('config-content').value = '';
+                    document.getElementById('auth-content').value = '';
+                    document.getElementById('codex-config-content').value = '';
                     toggleCollapsible('add-config-section'); // 自动关闭面板
                     await loadAccounts();
                 } else {
@@ -1386,6 +1628,11 @@ class WebHandler(BaseHTTPRequestHandler):
             } catch (error) {
                 showMessage('网络错误: ' + error.message, 'error');
             }
+        }
+
+        async function addConfig() {
+            // 兼容旧调用入口
+            await importConfig();
         }
 
         async function refreshUsage() {

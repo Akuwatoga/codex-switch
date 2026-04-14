@@ -9,6 +9,7 @@
     --bg-card: #fff;
     --text: #0f172a;
     --text-light: #64748b;
+    --text-muted: #94a3b8;
     --border: #e2e8f0;
     --primary: #3b82f6;
     --success: #10b981;
@@ -90,6 +91,33 @@ body {
 .toolbar-select:focus {
     background: var(--bg-card);
     border-color: var(--primary);
+}
+
+.provider-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    margin-left: 8px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--text-muted);
+}
+
+.provider-status.official .status-dot {
+    background: #4CAF50;
+}
+
+.provider-status.service .status-dot {
+    background: #FF9800;
 }
 
 /* 主内容区 */
@@ -421,6 +449,41 @@ body {
     gap: 10px;
 }
 
+.service-editor {
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: #f8fafc;
+}
+
+.service-editor-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 16px;
+}
+
+.service-profile-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 14px;
+}
+
+.service-profile-flags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px;
+}
+
+.checkbox-field {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text);
+}
+
 .form-hint {
     margin-top: 8px;
     color: var(--text-light);
@@ -474,6 +537,36 @@ textarea.form-input {
     resize: vertical;
     font-family: monospace;
     min-height: 100px;
+}
+
+@media (max-width: 900px) {
+    .titlebar {
+        height: auto;
+        padding: 14px 16px;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+    }
+
+    .titlebar-left, .titlebar-right {
+        flex-wrap: wrap;
+    }
+
+    .service-editor-header {
+        flex-direction: column;
+    }
+
+    .service-profile-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .statusbar {
+        height: auto;
+        padding: 10px 16px;
+        gap: 10px;
+        flex-direction: column;
+        align-items: flex-start;
+    }
 }
 
 /* Toast 消息 */

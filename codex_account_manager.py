@@ -10,7 +10,14 @@ import os
 import shutil
 from datetime import datetime
 from pathlib import Path
-from codex_auth import build_account_record, extract_account_id_from_auth, extract_email_from_auth, prepare_auth_for_switch
+from codex_auth import (
+    build_account_record,
+    extract_account_id_from_auth,
+    extract_email_from_auth,
+    extract_stored_auth,
+    prepare_auth_for_switch,
+    select_best_auth_snapshot,
+)
 from usage_checker import CodexUsageChecker
 from config_utils import get_config_paths, generate_account_name, load_settings, save_settings, get_auth_mode, set_auth_mode
 
@@ -46,6 +53,15 @@ class CodexAccountManager:
         except (OSError, IOError) as e:
             print(f"❌ 保存配置失败: {e}")
             return False
+
+    def _load_json_if_exists(self, file_path):
+        try:
+            if Path(file_path).exists():
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except (OSError, IOError, json.JSONDecodeError):
+            return None
+        return None
     
     def _copy_to_system(self):
         """将当前账号复制到系统 Codex 配置"""
@@ -150,14 +166,26 @@ class CodexAccountManager:
                     mode_desc = "API Key" if effective_mode == 'api_key' else "账号模式"
                     print(f"🌐 使用全局设置: {mode_desc}")
 
-            clean_config = prepare_auth_for_switch(target_config, force_mode=effective_mode)
+            freshness_candidates = [
+                self._load_json_if_exists(self.system_auth_file),
+                self._load_json_if_exists(self.system_auth_file.with_suffix('.json.backup')),
+            ]
+            selected_snapshot = select_best_auth_snapshot(
+                target_config,
+                freshness_candidates=[item for item in freshness_candidates if item],
+            )
+            clean_config = prepare_auth_for_switch(selected_snapshot, force_mode=effective_mode)
 
-            if self.system_auth_file.exists():
-                backup_file = self.system_auth_file.with_suffix('.json.backup')
-                shutil.copy2(self.system_auth_file, backup_file)
+            if selected_snapshot != extract_stored_auth(target_config):
+                target_config = build_account_record(selected_snapshot, account_name, saved_at=datetime.now().isoformat())
+                self._save_config(account_file, target_config)
+                print("♻️ 已用系统中的更新认证修复账号快照")
 
             # 直接写入系统 Codex 配置
             self.system_auth_file.parent.mkdir(parents=True, exist_ok=True)
+            if self.system_auth_file.exists():
+                backup_file = self.system_auth_file.with_suffix('.json.backup')
+                shutil.copy2(self.system_auth_file, backup_file)
             if self._save_config(self.system_auth_file, clean_config):
                 # 显示使用的模式
                 if effective_mode == 'api_key':
